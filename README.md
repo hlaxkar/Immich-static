@@ -53,7 +53,7 @@ python detect.py
 
 ---
 
-### 2. Step 2: Sync Results to Immich Tags & Albums
+### 2. Step 2: Sync Results to Immich Tags & Albums & Review
 Tag every video in Immich with its classification (**`video:static`**, **`video:review`**, **`video:dynamic`**) and organize them into albums:
 
 ```bash
@@ -63,14 +63,33 @@ python immich_sync.py --dry-run
 # 2. Live sync (applies tags and populates albums in Immich):
 python immich_sync.py
 
-# 3. Optional: Sync tags/albums AND upload local extracted frames in one step:
+# 3. View storage metrics and album sizes:
+python immich_sync.py --stats
+
+# 4. Optional: Sync tags/albums AND upload local extracted frames in one step:
 python immich_sync.py --upload-extracted
 ```
 
 ---
 
-### 3. Step 3: Extract Best Frames & Upload with "video:extracted" Tag
-Extract the sharpest frame from all videos classified as `static` directly from the checkpoint database:
+### 3. Step 3: Review in Immich & Pull Corrections to Database
+Review the albums directly in your Immich web / mobile app:
+1. Open **`[Static] Videos`** album in Immich.
+2. Select any false positives (dynamic videos) and click **"Remove from album"** (or move them to **`[Dynamic] Videos`**).
+3. Pull your changes back into the local SQLite database:
+
+```bash
+# Preview album pull changes:
+python immich_sync.py --pull-albums --dry-run
+
+# Pull Immich album corrections and update SQLite checkpoint:
+python immich_sync.py --pull-albums
+```
+
+---
+
+### 4. Step 4: Extract Best Frames & Upload with "video:extracted" Tag
+Extract the sharpest frame from all confirmed static videos directly from the updated checkpoint database:
 
 ```bash
 # 1. Extract frames locally (preserves original video creation timestamp and EXIF):
@@ -87,7 +106,7 @@ python immich_sync.py --upload-extracted
 
 ---
 
-### 4. Step 4: Continuous Monitoring for Future Uploads
+### 5. Step 5: Continuous Monitoring for Future Uploads
 To automatically classify and tag new videos uploaded to your Immich instance in the background:
 
 ```bash

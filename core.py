@@ -94,6 +94,19 @@ SENSITIVITY_PRESETS = {
 }
 
 
+def format_bytes(bytes_count: float) -> str:
+    """Converts raw byte count into human readable string (KB, MB, GB, TB)."""
+    if bytes_count <= 0:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    i = 0
+    val = float(bytes_count)
+    while val >= 1024.0 and i < len(units) - 1:
+        val /= 1024.0
+        i += 1
+    return f"{val:.2f} {units[i]}"
+
+
 # ─────────────────────────────────────────────
 # VIDEO PROBE & SAMPLING
 # ─────────────────────────────────────────────
@@ -604,6 +617,27 @@ class Checkpoint:
                     data.get("error", ""),
                 ))
                 conn.commit()
+
+    def update_decision(self, asset_id_or_filename: str, new_decision: str) -> bool:
+        """Updates the decision for a video in both memory cache and SQLite database."""
+        with self._lock:
+            row = self._cache_by_asset_id.get(asset_id_or_filename) or self._cache_by_filename.get(asset_id_or_filename)
+            if not row:
+                return False
+            row["decision"] = new_decision
+            aid = row.get("asset_id")
+            fn = row.get("filename")
+            if aid:
+                self._cache_by_asset_id[aid] = row
+            if fn:
+                self._cache_by_filename[fn] = row
+            with self._get_conn() as conn:
+                conn.execute(
+                    "UPDATE videos SET decision = ? WHERE asset_id = ? OR filename = ?",
+                    (new_decision, aid or asset_id_or_filename, fn or asset_id_or_filename)
+                )
+                conn.commit()
+            return True
 
     def save_meta(self, **kwargs):
         with self._get_conn() as conn:
