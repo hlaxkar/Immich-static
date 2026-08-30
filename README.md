@@ -1,125 +1,177 @@
 # 📸 Immich Static Video Toolkit (`immich-static`)
 
-A high-performance toolkit designed to scan large Immich libraries (60,000+ assets) via **direct filesystem mount**, detect **static / low-motion videos** (screen recordings, static slides, accidental burst videos, live photos), classify them into Immich albums, and extract crisp, sharpness-optimized still frames.
+An API-first, zero-download toolkit and CLI for Immich. It scans video libraries via **direct filesystem mount**, detects **static / low-motion videos** (slides, screen recordings, accidental burst videos, live photos), organizes them into Immich tags and albums via REST API, and extracts sharpness-optimized still frames.
 
 ---
 
 ## ⚡ Key Features
 
-1. **Direct Mount Speed (0 Network Overhead for Video Decoding)**:
-   - Reads directly from your local/mounted Immich storage volume (`/path/to/immich/library`).
-   - Uses sparse keyframe sampling and downscaled motion grids for high processing throughput across multi-core CPUs.
+1. **Zero-Download Speed (Local Mount Data Plane)**:
+   - Analyzes video frames directly on your mounted Immich storage volume (`/path/to/immich/library`) using multi-core OpenCV / FFmpeg.
 2. **Multi-Frame Motion & Zone Analysis**:
    - Analyzes global motion and $4\times4$ localized grid zones to classify videos into `static`, `review`, and `dynamic`.
-3. **Resumable SQLite Checkpoint**:
-   - Maintains a concurrent WAL SQLite database (`detection_checkpoint.sqlite`) so you can pause, interrupt (Ctrl+C), or resume at any time without re-analyzing processed assets.
-4. **Immich Album Sync Bridge**:
-   - Resolves local file paths to Immich Asset IDs via lightweight metadata API calls.
-   - Automatically populates `[Static] Videos`, `[Review] Videos`, and `[Dynamic] Videos` albums in your Immich instance.
-5. **Sharpness-Aware Frame Extractor**:
-   - Uses Laplacian variance ($Var(\nabla^2 f)$) across sampled frames to select and extract the single sharpest, least-blurry photo.
-6. **Continuous Incremental Watcher**:
-   - Runs in the background to automatically detect and classify future video uploads.
+3. **Unified CLI Architecture**:
+   - Single command `immich-static` with subcommands (`detect`, `sync`, `stats`, `pull`, `extract`, `watch`, `test`).
+4. **Resumable SQLite Checkpoint**:
+   - Thread-safe WAL SQLite database (`detection_checkpoint.sqlite`) allowing instant pause, interrupt (Ctrl+C), and resume.
+5. **Bidirectional Immich Sync**:
+   - Automatically populates `video:static`, `video:review`, and `video:dynamic` tags and albums in Immich.
+   - Allows manual UI review in Immich and pulls changes back with `immich-static pull`.
+6. **Sharpness-Aware Still Extractor**:
+   - Uses Laplacian variance ($Var(\nabla^2 f)$) across sampled frames to select and extract the single sharpest photo with EXIF metadata preserved.
+7. **Continuous Background Watcher**:
+   - Background daemon (`immich-static watch`) for incremental scanning of new video uploads.
 
 ---
 
-## 🛠 Prerequisites
+## 🛠 Installation & Prerequisites
 
 - Python 3.9+
-- `ffmpeg` & `ffprobe` installed on system
-- Python dependencies:
-  ```bash
-  pip install opencv-python-headless numpy tqdm
-  ```
+- `ffmpeg` & `ffprobe` installed on system (`sudo apt install ffmpeg`)
+
+### Install via pip:
+```bash
+# Clone the repository
+git clone https://github.com/yourusername/immich-static.git
+cd immich-static
+
+# Install locally in editable/development mode:
+pip install -e .
+
+# Or standard install:
+pip install .
+```
 
 ---
 
-## 🚀 Step-by-Step Usage Workflow
+## ⚙️ Configuration (`.env`)
 
-### 1. Step 1: Scan & Classify Mounted Immich Library (Safe / Local Only)
-Run detection against your mounted library folder:
+Create a `.env` file in your workspace or set system environment variables:
 
 ```bash
-# Scan and classify (saves to SQLite locally, makes NO changes to Immich)
-python detect.py
+IMMICH_API_URL=https://immich.yourdomain.com/api
+IMMICH_API_KEY=your_immich_api_key_here
+IMMICH_LIBRARY_PATH=/mnt/storage/immich/library
+
+# Optional defaults:
+SENSITIVITY=medium          # low | medium | high
+WORKERS=16                  # Parallel detection workers
+EXTRACT_OUTPUT_DIR=./extracted_frames
+EXTRACT_FORMAT=jpg          # jpg | png
+EXTRACT_QUALITY=95          # 1-100
+```
+
+---
+
+## 🚀 CLI Commands & Workflow
+
+### 1. Scan & Classify Mounted Immich Library (Local Only / Safe)
+```bash
+# Scan and save classifications into SQLite checkpoint (no changes to Immich):
+immich-static detect
 
 # Useful flags:
-#   --sync               (Optional: automatically sync tags & albums immediately after detection)
-#   --workers 8          (Set custom worker count)
-#   --sensitivity high   (low | medium | high)
-#   --report             (Print confidence & motion score breakdown)
-#   --export-csv [PATH]  (Optional: export results to CSV spreadsheet)
+immich-static detect --sensitivity high
+immich-static detect --workers 8
+immich-static detect --report                 # Print motion score details
+immich-static detect --export-csv results.csv # Export detection table to CSV
+immich-static detect --sync                   # Auto-sync to Immich after scan
+immich-static detect --dry-run                # Preview tag/album changes
 ```
 
 ---
 
-### 2. Step 2: Sync Results to Immich Tags & Albums & Review
-Tag every video in Immich with its classification (**`video:static`**, **`video:review`**, **`video:dynamic`**) and organize them into albums:
-
+### 2. View Storage Metrics & Savings Potential
 ```bash
-# 1. Preview changes safely without modifying Immich:
-python immich_sync.py --dry-run
-
-# 2. Live sync (applies tags and populates albums in Immich):
-python immich_sync.py
-
-# 3. View storage metrics and album sizes:
-python immich_sync.py --stats
-
-# 4. Optional: Sync tags/albums AND upload local extracted frames in one step:
-python immich_sync.py --upload-extracted
+immich-static stats
 ```
 
 ---
 
-### 3. Step 3: Review in Immich & Pull Corrections to Database
-Review the albums directly in your Immich web / mobile app:
-1. Open **`[Static] Videos`** album in Immich.
-2. Select any false positives (dynamic videos) and click **"Remove from album"** (or move them to **`[Dynamic] Videos`**).
+### 3. Sync Results to Immich Tags & Albums
+```bash
+# Preview changes safely without modifying Immich:
+immich-static sync --dry-run
+
+# Live sync (creates tags and populates [Static], [Review], [Dynamic] albums):
+immich-static sync
+
+# Sync and upload local extracted frames:
+immich-static sync --upload-extracted
+```
+
+---
+
+### 4. Review in Immich & Pull Corrections Back to Database
+1. Open **`[Static] Videos`** album in your Immich web / mobile app.
+2. Select any false positives and remove them or move them to **`[Dynamic] Videos`**.
 3. Pull your changes back into the local SQLite database:
 
 ```bash
-# Preview album pull changes:
-python immich_sync.py --pull-albums --dry-run
+# Preview changes:
+immich-static pull --dry-run
 
-# Pull Immich album corrections and update SQLite checkpoint:
-python immich_sync.py --pull-albums
+# Apply Immich album modifications to local checkpoint:
+immich-static pull
 ```
 
 ---
 
-### 4. Step 4: Extract Best Frames & Upload with "video:extracted" Tag
-Extract the sharpest frame from all confirmed static videos directly from the updated checkpoint database:
-
+### 5. Extract Sharpest Frames & Upload
 ```bash
-# 1. Extract frames locally (preserves original video creation timestamp and EXIF):
-python extract.py
+# 1. Extract frames locally (preserves original video timestamps):
+immich-static extract
 
-# 2. Extract AND upload directly to Immich with 'video:extracted' tag:
-python extract.py --upload
+# 2. Extract and upload directly to Immich with 'video:extracted' tag and '[Extracted] Photos' album:
+immich-static extract --upload
 
-# 3. If you extracted locally earlier, upload them now:
-python extract.py --upload
-# or:
-python immich_sync.py --upload-extracted
+# 3. Custom options:
+immich-static extract --target-decision review --format png
 ```
 
 ---
 
-### 5. Step 5: Continuous Monitoring for Future Uploads
-To automatically classify and tag new videos uploaded to your Immich instance in the background:
-
+### 6. Continuous Background Monitoring
+To continuously monitor the mounted library and automatically classify future uploads:
 ```bash
-python watch.py
+immich-static watch --interval 300
 ```
 
 ---
 
-## 📁 File Structure
+### 7. Run Verification Test Suite
+```bash
+immich-static test
+```
 
-- `core.py`: Shared core engine (FFmpeg sampling, motion scoring, Laplacian sharpness evaluation, SQLite checkpointing).
-- `detect.py`: Multi-threaded library scanner and motion classifier.
-- `extract.py`: Sharpness-optimized frame extractor (DB-driven or directory-driven).
-- `immich_sync.py`: Immich REST API bridge for asset ID resolution and album management.
-- `watch.py`: Background daemon for incremental scanning.
-- `test_suite.py`: Synthetic test video generator and validation suite.
+---
+
+## 📦 Package Structure
+
+```
+immich-static/
+├── pyproject.toml              # Modern build configuration (PEP 517/621)
+├── setup.py                    # Backward compatibility for pip install -e .
+├── requirements.txt            # Python dependencies
+├── immich_static/              # Main Python package
+│   ├── __init__.py             # Package version & top-level exports
+│   ├── __main__.py             # Entrypoint for `python -m immich_static`
+│   ├── cli.py                  # Main CLI argument parser and subcommand router
+│   ├── core.py                 # Motion analysis, Laplacian sharpness, Checkpoint DB
+│   ├── client.py               # Robust Immich REST API client
+│   ├── detect.py               # Multithreaded library scanner & classifier
+│   ├── sync.py                 # Tags/albums sync, pull, stats, and upload logic
+│   ├── extract.py              # Sharpness-aware still frame extractor
+│   ├── watch.py                # Background monitoring daemon
+│   └── test_suite.py           # Synthetic verification tests
+├── detect.py                   # Backward-compatibility root shim
+├── immich_sync.py              # Backward-compatibility root shim
+├── extract.py                  # Backward-compatibility root shim
+├── watch.py                    # Backward-compatibility root shim
+└── test_suite.py               # Backward-compatibility root shim
+```
+
+---
+
+## 📄 License
+MIT License.

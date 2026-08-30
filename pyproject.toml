@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "immich-static"
+version = "0.1.0"
+description = "High-performance toolkit and CLI for detecting static videos in Immich libraries, syncing albums/tags, and extracting sharp frames."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Immich Static Contributors" }
+]
+keywords = ["immich", "video", "static-detection", "ffmpeg", "opencv", "photos"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Multimedia :: Graphics",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "opencv-python-headless>=4.5.0",
+    "numpy>=1.20.0",
+    "tqdm>=4.60.0",
+]
+
+[project.scripts]
+immich-static = "immich_static.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["immich_static*"]
