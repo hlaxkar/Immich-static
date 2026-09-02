@@ -47,7 +47,7 @@ def sync_immich(
 
     # 2. Match Checkpoint Entries
     all_rows = ckpt.all_rows()
-    print(f"📊 Checkpoint contains {len(all_rows)} classified files.")
+    print(f"📊 Checkpoint contains {len(all_rows)} classified videos.")
 
     grouped_asset_ids: Dict[str, List[str]] = {
         "static": [],
@@ -144,7 +144,6 @@ def sync_immich(
             if dry_run:
                 print(f"   🔍 [DRY-RUN] Would apply tag '{target_tag_name}' to {len(asset_ids)} assets")
             else:
-                print(f"   🏷  Applying tag '{target_tag_name}' to {len(asset_ids)} assets...")
                 client.tag_assets(tag_id, asset_ids)
                 print(f"   ✅ Tagged '{target_tag_name}' ({len(asset_ids)} assets)")
         print()
@@ -186,9 +185,8 @@ def sync_immich(
                 if dry_run:
                     print(f"      🔍 [DRY-RUN] Would add {len(to_add)} assets to '{target_album_name}'")
                 else:
-                    print(f"      🚀 Adding {len(to_add)} assets to '{target_album_name}'...")
                     client.add_assets_to_album(album_id, to_add)
-                    print(f"      ✅ Done.")
+                    print(f"      ✅ Added {len(to_add)} assets to '{target_album_name}'.")
         print()
 
 
@@ -333,7 +331,7 @@ def pull_albums_to_checkpoint(
                 print(f"       ... and {len(items) - 5} more")
 
     if not has_any_change:
-        print("   ✅ Local checkpoint is already 100% in sync with Immich albums. No changes needed.")
+        print("   ✅ No reclassification changes detected. Local checkpoint matches Immich albums.")
     else:
         status_msg = "Would update" if dry_run else "Successfully updated"
         print(f"\n   🎉 {status_msg} {updated_count} record(s) in SQLite checkpoint.")
@@ -550,9 +548,9 @@ def upload_extracted_frames(client: ImmichClient, output_dir: Path, dry_run: boo
             aid = res["id"]
             status_str = res.get("status", "created")
             uploaded_ids.append(aid)
-            print(f"   Uploaded: {img_path.name} -> Immich ID: {aid} ({status_str})")
+            print(f"   ✅ {img_path.name} → {aid} ({status_str})")
         else:
-            print(f"   Uploaded: {img_path.name} -> (Response: {res})")
+            print(f"   ⚠️  Upload returned unexpected response for {img_path.name}")
 
     if uploaded_ids:
         client.tag_assets(tag_id, uploaded_ids)
@@ -570,7 +568,7 @@ def upload_extracted_frames(client: ImmichClient, output_dir: Path, dry_run: boo
         album_asset_ids = client.get_album_assets(album_id)
         all_to_tag = list(set(uploaded_ids) | album_asset_ids)
         client.tag_assets(tag_id, all_to_tag)
-        print(f"🏷  Verified tag '{tag_name}' across all {len(all_to_tag)} assets in '{album_name}'")
+        print(f"🏷  Ensured tag '{tag_name}' on all {len(all_to_tag)} assets in '{album_name}'")
 
 
 def _get_client_and_ckpt(args: Any, require_ckpt: bool = True, require_client: bool = True) -> Tuple[Optional[ImmichClient], Optional[Checkpoint]]:
@@ -592,7 +590,7 @@ def _get_client_and_ckpt(args: Any, require_ckpt: bool = True, require_client: b
         client = ImmichClient(api_url, api_key)
         try:
             ver = client.ping()
-            print(f"🌐 Connected to Immich Server (Version: {ver.get('major', '')}.{ver.get('minor', '')}.{ver.get('patch', '')})")
+            print(f"🌐 Connected to Immich Server (v{ver.get('major', '')}.{ver.get('minor', '')}.{ver.get('patch', '')})")
         except Exception as e:
             if require_client:
                 print(f"❌ Failed to connect to Immich server at {api_url}: {e}")
@@ -658,7 +656,6 @@ def run_stats(args: Any):
     """Executes the `immich-static stats` command."""
     client, ckpt = _get_client_and_ckpt(args, require_ckpt=False, require_client=False)
     display_storage_stats(client=client, ckpt=ckpt)
-    print("✨ Complete!")
 
 
 def run_restore(args: Any):

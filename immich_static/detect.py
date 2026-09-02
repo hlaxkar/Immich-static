@@ -135,7 +135,7 @@ def run_detect(args: Any):
     # 2. Fetch User-Scoped Video Catalog via API
     immich_videos = client.get_all_video_assets()
     if not immich_videos:
-        print("No video assets found in your Immich library.")
+        print("ℹ️  No video assets found in your Immich library.")
         sys.exit(0)
 
     # 3. Resolve Local Disk Paths

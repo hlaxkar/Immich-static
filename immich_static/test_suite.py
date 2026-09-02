@@ -65,7 +65,7 @@ def run_tests():
         # Test 1: Metadata Extraction
         print("\n--- Test 1: Video Metadata Probe ---")
         meta_static = get_video_metadata(static_vid)
-        print(f"Static video meta: {meta_static}")
+        print(f"Static video: {meta_static['width']}x{meta_static['height']}, {meta_static['duration']}s, {meta_static['fps']}fps")
         assert meta_static["width"] == 640
         assert meta_static["height"] == 360
         assert abs(meta_static["duration"] - 3.0) < 0.5
@@ -102,7 +102,7 @@ def run_tests():
         print("\n--- Test 5: Laplacian Sharpness Frame Extraction ---")
         out_frame = TEST_DIR / "extracted_static.jpg"
         extract_res = extract_one_frame(static_vid, out_frame, fmt="jpg", quality=95)
-        print(f"Extraction result: {extract_res}")
+        print(f"Extraction result: status={extract_res['status']}, sharpness={extract_res.get('sharpness', '?')}, timestamp={extract_res.get('timestamp_s', '?')}s")
         assert extract_res["status"] == "ok"
         assert out_frame.exists() and out_frame.stat().st_size > 0
         print("✅ Best frame extracted successfully!")
