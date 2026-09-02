@@ -256,9 +256,9 @@ def check_system_dependencies(need_cv: bool = True):
     print("❌ Missing required dependencies:")
     for m in missing:
         print(f"   • {m}")
-    print("\nPlease install:")
-    print("   sudo apt update && sudo apt install -y ffmpeg")
-    print("   pip install opencv-python-headless numpy tqdm")
+    print("\nPlease install the missing dependencies:")
+    print("   ffmpeg  → apt install ffmpeg / brew install ffmpeg / pkg install ffmpeg")
+    print("   python  → pip install opencv-python-headless numpy tqdm")
     sys.exit(1)
 
 
