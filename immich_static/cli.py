@@ -11,6 +11,7 @@ from immich_static.core import CHECKPOINT_FILENAME, ENV, load_dotenv
 from immich_static.detect import run_detect
 from immich_static.extract import run_extract
 from immich_static.server import run_serve
+from immich_static.service import run_service
 from immich_static.sync import run_pull, run_restore, run_stats, run_sync
 from immich_static.test_suite import run_test_cmd
 from immich_static.watch import run_watch
@@ -399,6 +400,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Immich API Key for automatic syncing",
     )
     p_watch.set_defaults(func=run_watch)
+
+    # ─────────────────────────────────────────────
+    # SUBCOMMAND: SERVICE (systemd)
+    # ─────────────────────────────────────────────
+    p_service = subparsers.add_parser(
+        "service",
+        help="Manage background systemd service for auto-start on boot.",
+        description="Installs, uninstalls, and manages the immich-static background webhook service via systemd.",
+    )
+    p_service.add_argument(
+        "action",
+        choices=["install", "uninstall", "status", "start", "stop", "restart", "logs"],
+        help="Service lifecycle action",
+    )
+    p_service.add_argument(
+        "--port", type=int, default=8080,
+        help="Port to listen for webhooks (for install action, default: 8080)",
+    )
+    p_service.add_argument(
+        "--secret", default=os.environ.get("WEBHOOK_SECRET"),
+        help="Shared secret token for webhook authentication",
+    )
+    p_service.add_argument(
+        "--system", action="store_true",
+        help="Install as system-wide service (/etc/systemd/system) instead of user service",
+    )
+    p_service.add_argument(
+        "--dry-run", action="store_true",
+        help="Preview generated systemd unit configuration without installing",
+    )
+    p_service.set_defaults(func=run_service)
 
     # ─────────────────────────────────────────────
     # SUBCOMMAND: TEST
