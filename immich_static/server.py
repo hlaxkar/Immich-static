@@ -94,22 +94,51 @@ def resolve_asset_file_path(
 def extract_asset_info_from_payload(payload: Any) -> Tuple[Optional[str], Dict[str, Any]]:
     """
     Extracts assetId and metadata dictionary from various Immich workflow webhook payload structures.
-    Supports direct AssetDTO, nested workflow contexts, and event action wrappers.
+    Supports nested workflow contexts (e.g. data.asset), direct AssetDTO, and wrapped actions.
     """
     if not isinstance(payload, dict):
         return None, {}
 
-    # 1. Direct asset DTO
-    if "id" in payload and any(k in payload for k in ("originalPath", "type", "originalFileName")):
+    # 1. Immich Workflows standard structure: data -> asset -> id
+    data = payload.get("data")
+    if isinstance(data, dict):
+        asset = data.get("asset")
+        if isinstance(asset, dict) and "id" in asset:
+            return str(asset["id"]), asset
+        if "id" in data and any(k in data for k in ("originalPath", "type", "originalFileName", "ownerId")):
+            return str(data["id"]), data
+
+    # 2. Wrapped directly in asset container: asset -> id
+    asset = payload.get("asset")
+    if isinstance(asset, dict) and "id" in asset:
+        return str(asset["id"]), asset
+
+    # 3. Direct asset DTO
+    if "id" in payload and any(k in payload for k in ("originalPath", "type", "originalFileName", "ownerId")):
         return str(payload["id"]), payload
 
-    # 2. Wrapped in action/event container
-    for key in ("asset", "data", "item", "payload", "entity"):
-        sub = payload.get(key)
-        if isinstance(sub, dict) and "id" in sub:
-            return str(sub["id"]), sub
+    # 4. Recursive search for candidate asset dictionary
+    candidates = []
+    def _search(d: Any, depth: int = 0):
+        if depth > 4 or not isinstance(d, dict):
+            return
+        if "id" in d and isinstance(d["id"], (str, int)):
+            score = 0
+            if "type" in d: score += 3
+            if "originalPath" in d: score += 3
+            if "originalFileName" in d: score += 2
+            if "ownerId" in d: score += 1
+            candidates.append((score, str(d["id"]), d))
+        for v in d.values():
+            if isinstance(v, dict):
+                _search(v, depth + 1)
 
-    # 3. Direct ID or assetId field
+    _search(payload)
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1], candidates[0][2]
+
+    # 5. Fallback for raw ID strings
     if "assetId" in payload:
         return str(payload["assetId"]), payload
     if "id" in payload:
@@ -152,14 +181,23 @@ class WebhookServer(ThreadingHTTPServer):
         self.worker_queue: queue.Queue = queue.Queue()
 
 
+def _log(msg: str):
+    """Outputs a timestamped log line with immediate buffer flushing."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
+
 class WebhookRequestHandler(BaseHTTPRequestHandler):
     """HTTP request handler for Immich webhook callbacks and health status."""
 
     server: WebhookServer
 
     def log_message(self, format: str, *args: Any):
-        # Override to suppress standard HTTP access logging clutter
+        # Override standard HTTP access log to use our custom formatter
         pass
+
+    def _client_ip(self) -> str:
+        return self.client_address[0] if self.client_address else "unknown"
 
     def _send_json(self, status_code: int, data: dict):
         body = json.dumps(data).encode("utf-8")
@@ -168,6 +206,7 @@ class WebhookRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+        _log(f"📤 [HTTP] {self._client_ip()} <- {status_code} Response: {json.dumps(data)}")
 
     def _is_authorized(self) -> bool:
         expected_secret = self.server.secret
@@ -196,6 +235,7 @@ class WebhookRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        _log(f"🔍 [HTTP] {self._client_ip()} -> GET {self.path}")
         if parsed.path in ("/", "/health", "/status"):
             uptime = round(time.time() - _start_time, 1)
             self._send_json(
@@ -213,17 +253,19 @@ class WebhookRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        content_length = int(self.headers.get("Content-Length", 0))
+        _log(f"📩 [HTTP] {self._client_ip()} -> POST {self.path} ({content_length} bytes)")
+
         if parsed.path not in ("/webhook", "/webhook/"):
             self._send_json(404, {"error": f"Endpoint not found: {parsed.path}"})
             return
 
         if not self._is_authorized():
-            print("⚠️  [WEBHOOK] Unauthorized webhook request rejected (invalid secret).")
+            _log("⚠️  [AUTH] Unauthorized webhook request rejected (invalid secret).")
             self._send_json(401, {"error": "Unauthorized. Provide valid secret token."})
             return
 
         # Parse request body
-        content_length = int(self.headers.get("Content-Length", 0))
         if content_length <= 0:
             self._send_json(400, {"error": "Empty request body"})
             return
@@ -237,20 +279,21 @@ class WebhookRequestHandler(BaseHTTPRequestHandler):
 
         asset_id, asset_data = extract_asset_info_from_payload(payload)
         if not asset_id:
-            print(f"⚠️  [WEBHOOK] Received webhook with no identifiable asset ID: {payload}")
+            _log(f"⚠️  [WEBHOOK] Received webhook with no identifiable asset ID: {payload}")
             self._send_json(400, {"error": "No asset ID found in webhook payload"})
             return
 
         # Quick pre-filter: if payload explicitly declares non-video asset
         asset_type = asset_data.get("type")
         if asset_type and asset_type.upper() not in ("VIDEO", "LIVE_PHOTO_VIDEO"):
+            _log(f"ℹ️  [FILTER] Skipped non-video asset {asset_id} (type: {asset_type})")
             self._send_json(200, {"status": "ignored", "reason": f"Asset type is {asset_type}, not VIDEO"})
             return
 
         # Enqueue for asynchronous background processing to prevent webhook timeout
         self.server.worker_queue.put((asset_id, asset_data))
         qsize = self.server.worker_queue.qsize()
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 📥 [WEBHOOK] Queued asset {asset_id} (queue depth: {qsize})")
+        _log(f"📥 [QUEUE] Asset {asset_id} enqueued successfully (queue depth: {qsize})")
 
         self._send_json(202, {"status": "queued", "asset_id": asset_id, "queue_depth": qsize})
 
@@ -290,13 +333,13 @@ def _process_queued_asset(server: WebhookServer, asset_id: str, asset_data: Dict
     # Check asset type
     asset_type = (full_info.get("type") or "").upper()
     if asset_type and asset_type not in ("VIDEO", "LIVE_PHOTO_VIDEO"):
-        print(f"ℹ️  [WEBHOOK] Skipped {asset_id}: asset type is {asset_type} (not VIDEO)")
+        _log(f"ℹ️  [SKIP] Asset {asset_id}: type is {asset_type} (not VIDEO)")
         return
 
     # Check already processed in checkpoint
     if ckpt.is_done(asset_id):
         existing = ckpt.get(asset_id) or {}
-        print(f"ℹ️  [WEBHOOK] Asset {asset_id} already classified as '{existing.get('decision', '?')}'. Skipping.")
+        _log(f"ℹ️  [SKIP] Asset {asset_id} already classified as '{existing.get('decision', '?')}'. Skipping.")
         return
 
     # 2. Resolve local filesystem path
@@ -318,7 +361,7 @@ def _process_queued_asset(server: WebhookServer, asset_id: str, asset_data: Dict
         if ext not in VIDEO_EXTENSIONS:
             ext = ".mp4"
 
-        print(f"📡 [WEBHOOK] Local file not found on mount. Streaming asset {asset_id} via Immich API...")
+        _log(f"📡 [DOWNLOAD] Local file not found on mount. Streaming asset {asset_id} via Immich API...")
         temp_dir = Path(tempfile.gettempdir()) / "immich_static_cache"
         temp_file = temp_dir / f"stream_{asset_id}{ext}"
         try:
@@ -326,12 +369,12 @@ def _process_queued_asset(server: WebhookServer, asset_id: str, asset_data: Dict
             video_path = temp_file
             temp_downloaded_file = temp_file
         except Exception as e:
-            print(f"❌ [WEBHOOK] Failed to download asset {asset_id}: {e}")
+            _log(f"❌ [ERROR] Failed to download asset {asset_id}: {e}")
             return
 
     # 3. Run detection engine
     orig_name = full_info.get("originalFileName") or video_path.name
-    print(f"🎬 [WEBHOOK] Analyzing motion for '{orig_name}' ({asset_id})...")
+    _log(f"🎬 [DETECT] Analyzing motion for '{orig_name}' (ID: {asset_id})...")
 
     try:
         row = detect_video(video_path, thresholds)
@@ -349,7 +392,9 @@ def _process_queued_asset(server: WebhookServer, asset_id: str, asset_data: Dict
 
     decision = row.get("decision", "unknown")
     motion = row.get("global_motion_score", "?")
-    print(f"   [{decision.upper()}] {orig_name} (motion: {motion})")
+    zones = row.get("active_zone_ratio", "?")
+    duration = row.get("duration_s", "?")
+    _log(f"📊 [DECISION] '{orig_name}' -> {decision.upper()} | motion: {motion} | active_zones: {zones} | duration: {duration}s")
 
     # 4. Apply targeted tag & album sync to Immich
     if decision in ("static", "review", "dynamic"):
@@ -362,8 +407,7 @@ def _process_queued_asset(server: WebhookServer, asset_id: str, asset_data: Dict
             include_dynamic=server.include_dynamic,
             dry_run=server.dry_run,
         )
-        if sync_res.get("tagged") or sync_res.get("album_added"):
-            print(f"   ✅ Immich updated: Tagged={sync_res.get('tagged')} | AlbumAdded={sync_res.get('album_added')}")
+        _log(f"🏷️  [SYNC] Immich updated for '{orig_name}': Tagged={sync_res.get('tagged')} | AlbumAdded={sync_res.get('album_added')}")
 
     # 5. Optional sharpest frame extraction
     if server.extract_frame and decision == "static" and video_path.is_file():
@@ -373,12 +417,12 @@ def _process_queued_asset(server: WebhookServer, asset_id: str, asset_data: Dict
         out_frame = out_dir / f"{stem}.jpg"
         try:
             extract_one_frame(video_path, out_frame, fmt="jpg", quality=95)
-            print(f"   📸 Extracted frame: {out_frame.name}")
+            _log(f"📸 [EXTRACT] Extracted frame: {out_frame.name}")
             if not server.dry_run:
                 client.upload_asset(out_frame)
-                print(f"   ⬆️  Uploaded extracted frame to Immich")
+                _log(f"⬆️  [UPLOAD] Uploaded extracted frame to Immich")
         except Exception as e:
-            print(f"   ⚠️  Frame extraction failed: {e}")
+            _log(f"⚠️  [EXTRACT] Frame extraction failed: {e}")
 
     # 6. Cleanup temporary download
     if temp_downloaded_file and temp_downloaded_file.exists():
