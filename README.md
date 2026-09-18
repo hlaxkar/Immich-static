@@ -160,6 +160,25 @@ immich-static serve \
      - `X-Webhook-Secret`: `my_secure_token`
 5. Save and activate the workflow. New video uploads will be classified and tagged instantly!
 
+#### Running in Background via systemd (Auto-Start on Boot)
+You can install and run the webhook server as a background service with a single command without writing configuration files manually:
+
+```bash
+# Auto-detects Python environment, .env file, and installs as auto-starting systemd service:
+immich-static service install --port 8080 --secret my_secure_token
+
+# Preview what it will configure without installing:
+immich-static service install --dry-run
+
+# Manage the service:
+immich-static service status    # Check daemon health & status
+immich-static service logs      # Stream live journal logs
+immich-static service restart   # Restart daemon
+immich-static service stop      # Stop daemon
+immich-static service uninstall # Remove service unit
+```
+*Note: By default, it installs as a **user-level service** (`systemctl --user`) and enables lingering (`loginctl enable-linger`), meaning it starts automatically on system boot **without requiring sudo/root permissions**! (Pass `--system` if you prefer system-wide `/etc/systemd/system`).*
+
 ---
 
 ### 7. Continuous Polling Watcher (Legacy Fallback)
