@@ -52,6 +52,7 @@ After=network.target
 [Service]
 Type=simple
 {user_line}WorkingDirectory={working_dir.resolve()}
+Environment=PYTHONUNBUFFERED=1
 ExecStart={exec_start}
 Restart=always
 RestartSec=5
