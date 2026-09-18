@@ -17,6 +17,100 @@ from immich_static.core import (
 )
 
 
+_TAG_CACHE: Dict[str, str] = {}
+_ALBUM_CACHE: Dict[str, str] = {}
+
+
+def get_or_create_tag_id(client: ImmichClient, tag_name: str) -> str:
+    """Retrieves or creates a tag ID in Immich, using in-memory cache."""
+    global _TAG_CACHE
+    if tag_name in _TAG_CACHE:
+        return _TAG_CACHE[tag_name]
+    existing_tags = client.get_tags()
+    for t in existing_tags:
+        if t.get("name") == tag_name and "id" in t:
+            _TAG_CACHE[tag_name] = t["id"]
+            return t["id"]
+    new_tag = client.create_tag(tag_name)
+    tid = new_tag["id"]
+    _TAG_CACHE[tag_name] = tid
+    return tid
+
+
+def get_or_create_album_id(client: ImmichClient, album_name: str) -> str:
+    """Retrieves or creates an album ID in Immich, using in-memory cache."""
+    global _ALBUM_CACHE
+    if album_name in _ALBUM_CACHE:
+        return _ALBUM_CACHE[album_name]
+    existing_albums = client.get_albums()
+    for a in existing_albums:
+        if a.get("albumName") == album_name and "id" in a:
+            _ALBUM_CACHE[album_name] = a["id"]
+            return a["id"]
+    new_album = client.create_album(album_name)
+    aid = new_album["id"]
+    _ALBUM_CACHE[album_name] = aid
+    return aid
+
+
+def sync_single_asset(
+    client: ImmichClient,
+    asset_id: str,
+    decision: str,
+    sync_tags: bool = True,
+    sync_albums: bool = True,
+    include_dynamic: bool = True,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """
+    Directly syncs a single classified video asset to Immich Tags and Albums in O(1) time.
+    """
+    if decision not in ("static", "review", "dynamic"):
+        return {"status": "skipped", "reason": f"unhandled decision: {decision}"}
+    if decision == "dynamic" and not include_dynamic:
+        return {"status": "skipped", "reason": "dynamic excluded"}
+
+    tag_name_map = {
+        "static": os.environ.get("TAG_STATIC", "video:static"),
+        "review": os.environ.get("TAG_REVIEW", "video:review"),
+        "dynamic": os.environ.get("TAG_DYNAMIC", "video:dynamic"),
+    }
+    album_name_map = {
+        "static": "[Static] Videos",
+        "review": "[Review] Videos",
+        "dynamic": "[Dynamic] Videos",
+    }
+
+    target_tag = tag_name_map[decision]
+    target_album = album_name_map[decision]
+
+    res = {"asset_id": asset_id, "decision": decision, "tagged": False, "album_added": False}
+
+    if sync_tags:
+        if dry_run:
+            print(f"   🔍 [DRY-RUN] Would tag {asset_id} as '{target_tag}'")
+        else:
+            try:
+                tid = get_or_create_tag_id(client, target_tag)
+                client.tag_assets(tid, [asset_id])
+                res["tagged"] = True
+            except Exception as e:
+                print(f"⚠️  Failed to tag asset {asset_id} as '{target_tag}': {e}")
+
+    if sync_albums:
+        if dry_run:
+            print(f"   🔍 [DRY-RUN] Would add {asset_id} to album '{target_album}'")
+        else:
+            try:
+                aid = get_or_create_album_id(client, target_album)
+                added_count, _ = client.add_assets_to_album(aid, [asset_id])
+                res["album_added"] = (added_count > 0)
+            except Exception as e:
+                print(f"⚠️  Failed to add asset {asset_id} to album '{target_album}': {e}")
+
+    return res
+
+
 def sync_immich(
     client: ImmichClient,
     ckpt: Checkpoint,

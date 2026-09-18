@@ -10,6 +10,7 @@ from immich_static import __version__
 from immich_static.core import CHECKPOINT_FILENAME, ENV, load_dotenv
 from immich_static.detect import run_detect
 from immich_static.extract import run_extract
+from immich_static.server import run_serve
 from immich_static.sync import run_pull, run_restore, run_stats, run_sync
 from immich_static.test_suite import run_test_cmd
 from immich_static.watch import run_watch
@@ -288,6 +289,79 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sensitivity preset (default: medium)",
     )
     p_restore.set_defaults(func=run_restore)
+
+    # ─────────────────────────────────────────────
+    # SUBCOMMAND: SERVE / WEBHOOK
+    # ─────────────────────────────────────────────
+    p_serve = subparsers.add_parser(
+        "serve",
+        aliases=["webhook"],
+        help="Run real-time webhook daemon for Immich workflow notifications.",
+        description="Listens for Immich Workflows AssetCreate webhooks, processes newly uploaded videos on the fly, and syncs tags & albums.",
+    )
+    p_serve.add_argument(
+        "folder", nargs="?", default=os.environ.get("IMMICH_LIBRARY_PATH"),
+        help="Path to mounted Immich library directory (optional; falls back to API streaming)",
+    )
+    p_serve.add_argument(
+        "--host", default=os.environ.get("WEBHOOK_HOST", "0.0.0.0"),
+        help="Host interface to bind HTTP webhook server (default: 0.0.0.0)",
+    )
+    p_serve.add_argument(
+        "--port", type=int, default=int(os.environ.get("WEBHOOK_PORT", 8080)),
+        help="Port to listen for webhooks (default: 8080)",
+    )
+    p_serve.add_argument(
+        "--secret", default=os.environ.get("WEBHOOK_SECRET"),
+        help="Shared secret token for webhook authentication (header X-Webhook-Secret)",
+    )
+    p_serve.add_argument(
+        "--remote-prefix", default=os.environ.get("IMMICH_REMOTE_PATH_PREFIX"),
+        help="Remote path prefix to remap (e.g. Docker container path '/usr/src/app/upload')",
+    )
+    p_serve.add_argument(
+        "--local-prefix", default=os.environ.get("IMMICH_LOCAL_PATH_PREFIX"),
+        help="Local path prefix to replace remote prefix with (e.g. '/mnt/storage/immich')",
+    )
+    p_serve.add_argument(
+        "--sensitivity", choices=["low", "medium", "high"],
+        default=os.environ.get("SENSITIVITY", "medium"),
+        help="Detection sensitivity preset (default: medium)",
+    )
+    p_serve.add_argument(
+        "--workers", type=int, default=2,
+        help="Concurrent background video processing workers (default: 2)",
+    )
+    p_serve.add_argument(
+        "--include-dynamic", action=argparse.BooleanOptionalAction, default=True,
+        help="Also tag and create album for dynamic videos (default: True)",
+    )
+    p_serve.add_argument(
+        "--extract", action="store_true",
+        help="Extract sharpest still frame for static videos and upload to Immich",
+    )
+    p_serve.add_argument(
+        "--extract-dir", default=os.environ.get("EXTRACT_OUTPUT_DIR", "./extracted_frames"),
+        help="Directory to save extracted still frames",
+    )
+    p_serve.add_argument(
+        "--db", "--db-path", dest="db_path",
+        default=os.environ.get("DB_PATH", "./" + CHECKPOINT_FILENAME),
+        help="Path to SQLite checkpoint database",
+    )
+    p_serve.add_argument(
+        "--api-url", default=os.environ.get("IMMICH_API_URL"),
+        help="Immich API URL (required)",
+    )
+    p_serve.add_argument(
+        "--api-key", default=os.environ.get("IMMICH_API_KEY"),
+        help="Immich API Key (required)",
+    )
+    p_serve.add_argument(
+        "--dry-run", action="store_true",
+        help="Process videos and log decisions without modifying Immich tags/albums",
+    )
+    p_serve.set_defaults(func=run_serve)
 
     # ─────────────────────────────────────────────
     # SUBCOMMAND: WATCH
