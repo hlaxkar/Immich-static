@@ -744,6 +744,10 @@ class Checkpoint:
                 if fn:
                     self._cache_by_filename[fn] = d
 
+    def get(self, key: str) -> Optional[Dict[str, Any]]:
+        """Retrieves cached record by asset_id or filename."""
+        return self._cache_by_asset_id.get(key) or self._cache_by_filename.get(key)
+
     def is_done(self, key: str) -> bool:
         row = self._cache_by_asset_id.get(key) or self._cache_by_filename.get(key)
         if not row:

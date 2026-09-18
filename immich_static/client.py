@@ -46,6 +46,30 @@ class ImmichClient:
         """Verifies server connectivity and authentication."""
         return self._request("GET", "/api/server/version")
 
+    def get_asset_info(self, asset_id: str) -> Dict[str, Any]:
+        """Retrieves detailed metadata for a single asset."""
+        return self._request("GET", f"/api/assets/{asset_id}") or {}
+
+    def download_asset(self, asset_id: str, target_path: Path) -> Path:
+        """Downloads original asset binary to local target path."""
+        url = f"{self.base_url}/api/assets/{asset_id}/original"
+        headers = {"x-api-key": self.api_key}
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with urllib.request.urlopen(req, timeout=300) as resp, open(target_path, "wb") as out_f:
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out_f.write(chunk)
+            return target_path
+        except urllib.error.HTTPError as e:
+            err_body = e.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(f"Immich asset download failed HTTP {e.code}: {err_body}")
+        except Exception as e:
+            raise RuntimeError(f"Immich asset download failed: {e}")
+
     def get_all_video_assets(self, verbose: bool = True) -> List[Dict[str, Any]]:
         """Retrieves all video assets from Immich library with pagination."""
         videos = []

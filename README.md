@@ -131,15 +131,46 @@ immich-static extract --target-decision review --format png
 
 ---
 
-### 6. Continuous Background Monitoring
-To continuously monitor the mounted library and automatically classify future uploads:
+### 6. Real-Time Webhook Daemon (Recommended for Immich v3+)
+Instead of periodic disk polling, run `immich-static` as an event-driven webhook listener triggered instantly when videos are uploaded:
+
+```bash
+# Start the webhook server daemon:
+immich-static serve --port 8080 --secret my_secure_token
+
+# Or with custom options:
+immich-static serve \
+    --host 0.0.0.0 \
+    --port 8080 \
+    --secret my_secure_token \
+    --sensitivity medium \
+    --workers 4 \
+    --extract # Auto-extract sharpest still frame for static videos
+```
+
+#### Configuring Immich Workflows (Immich v3.0.0+):
+1. In the Immich web interface, navigate to **Administration** > **Workflows**.
+2. Click **Create Workflow** and set Trigger to **Asset Created** / **Asset Upload**.
+3. (Optional) Add a condition: `asset.type == 'VIDEO'`.
+4. Add action: **Webhook**:
+   - **Method**: `POST`
+   - **URL**: `http://<YOUR_IMMICH_STATIC_HOST>:8080/webhook`
+   - **Headers**:
+     - `Content-Type`: `application/json`
+     - `X-Webhook-Secret`: `my_secure_token`
+5. Save and activate the workflow. New video uploads will be classified and tagged instantly!
+
+---
+
+### 7. Continuous Polling Watcher (Legacy Fallback)
+For offline environments or older Immich versions (< v3.0.0) without Workflows:
 ```bash
 immich-static watch --interval 300
 ```
 
 ---
 
-### 7. Run Verification Test Suite
+### 8. Run Verification Test Suite
 ```bash
 immich-static test
 ```
@@ -161,13 +192,15 @@ immich-static/
 │   ├── client.py               # Robust Immich REST API client
 │   ├── detect.py               # Multithreaded library scanner & classifier
 │   ├── sync.py                 # Tags/albums sync, pull, stats, and upload logic
+│   ├── server.py               # Real-time webhook server & async worker queue
 │   ├── extract.py              # Sharpness-aware still frame extractor
-│   ├── watch.py                # Background monitoring daemon
+│   ├── watch.py                # Periodic polling background watcher
 │   └── test_suite.py           # Synthetic verification tests
 ├── detect.py                   # Backward-compatibility root shim
 ├── immich_sync.py              # Backward-compatibility root shim
 ├── extract.py                  # Backward-compatibility root shim
 ├── watch.py                    # Backward-compatibility root shim
+├── serve.py                    # Backward-compatibility root shim
 └── test_suite.py               # Backward-compatibility root shim
 ```
 

@@ -13,6 +13,7 @@ from immich_static.core import (
     resolve_local_video_path,
 )
 from immich_static.client import ImmichClient
+from immich_static.server import run_serve
 
 __all__ = [
     "__version__",
@@ -22,4 +23,5 @@ __all__ = [
     "extract_one_frame",
     "get_video_metadata",
     "resolve_local_video_path",
+    "run_serve",
 ]
