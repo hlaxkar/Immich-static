@@ -249,21 +249,39 @@ def run_detect(args: Any):
         ckpt.wait_for_writes()
 
     ckpt.flush_and_stop()
-    all_rows = ckpt.all_rows()
+
+    active_aids = {asset["id"] for (asset, _) in valid_targets}
+    active_fns = {str(vp.resolve()) for (_, vp) in valid_targets}
+
+    if getattr(args, "prune", False):
+        pruned = ckpt.prune_missing(active_aids, active_fns)
+        if pruned > 0:
+            print(f"🧹 Pruned {pruned} orphaned video record(s) from checkpoint DB.\n")
+
+    all_db_rows = ckpt.all_rows()
+    active_rows = [
+        r for r in all_db_rows
+        if r.get("asset_id") in active_aids or r.get("filename") in active_fns
+    ]
+    orphaned_count = len(all_db_rows) - len(active_rows)
 
     if csv_path:
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=LOG_FIELDS, extrasaction="ignore")
             writer.writeheader()
-            writer.writerows(all_rows)
+            writer.writerows(active_rows)
 
     script_end_time = time.time()
     total_time_taken = script_end_time - script_start_time
 
-    print_summary(all_rows, interrupted=interrupted, total_time=total_time_taken)
+    print_summary(active_rows, interrupted=interrupted, total_time=total_time_taken)
+
+    if orphaned_count > 0 and not getattr(args, "prune", False):
+        print(f"💡 Note: Checkpoint database contains {orphaned_count} historical entries from deleted/moved videos.")
+        print("   • Run `immich-static detect --prune` or `immich-static sync --prune` to clean them up.\n")
 
     if getattr(args, "report", False):
-        print_report(all_rows)
+        print_report(active_rows)
 
     print(f"💾 Checkpoint DB : {ckpt_path}")
     if csv_path:

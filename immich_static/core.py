@@ -824,13 +824,29 @@ class Checkpoint:
 
     def all_rows(self) -> List[Dict[str, Any]]:
         with self._lock:
-            seen_ids = set()
-            merged = []
-            for r in list(self._cache_by_asset_id.values()) + list(self._cache_by_filename.values()):
-                if id(r) not in seen_ids:
-                    seen_ids.add(id(r))
-                    merged.append(r)
-            return merged
+            with self._get_conn() as conn:
+                cur = conn.execute("SELECT * FROM videos")
+                return [dict(r) for r in cur.fetchall()]
+
+    def prune_missing(self, active_asset_ids: Set[str], active_filenames: Optional[Set[str]] = None) -> int:
+        """Removes entries from the checkpoint database that are neither in active_asset_ids nor active_filenames."""
+        active_filenames = active_filenames or set()
+        with self._lock:
+            with self._get_conn() as conn:
+                cur = conn.execute("SELECT asset_id, filename FROM videos")
+                rows = cur.fetchall()
+                to_delete = [
+                    (r["asset_id"], r["filename"])
+                    for r in rows
+                    if r["asset_id"] not in active_asset_ids and r["filename"] not in active_filenames
+                ]
+                for aid, fn in to_delete:
+                    conn.execute("DELETE FROM videos WHERE asset_id = ? AND filename = ?", (aid, fn))
+                conn.commit()
+            self._cache_by_asset_id.clear()
+            self._cache_by_filename.clear()
+            self._load_cache()
+            return len(to_delete)
 
     def clear(self):
         with self._lock:

@@ -100,6 +100,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--debug", action="store_true",
         help="Print ffmpeg stderr for any video that fails frame extraction",
     )
+    p_detect.add_argument(
+        "--prune", action="store_true",
+        help="Remove orphaned records from SQLite checkpoint for videos no longer in Immich",
+    )
     p_detect.set_defaults(func=run_detect)
 
     # ─────────────────────────────────────────────
@@ -138,6 +142,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync.add_argument(
         "--upload-extracted", action="store_true",
         help="Also upload local extracted frames in EXTRACT_OUTPUT_DIR to Immich",
+    )
+    p_sync.add_argument(
+        "--prune", action="store_true",
+        help="Remove orphaned records from SQLite checkpoint for videos no longer in Immich",
     )
     p_sync.add_argument(
         "--dry-run", action="store_true",
