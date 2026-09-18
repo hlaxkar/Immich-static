@@ -131,12 +131,67 @@ class ImmichClient:
 
         return asset_ids
 
-    def add_assets_to_album(self, album_id: str, asset_ids: List[str]):
-        """Adds asset IDs to an album in batches of 500."""
+    def find_parent_motion_photo(self, video_id: str, original_file_name: Optional[str] = None) -> Optional[str]:
+        """Finds the parent IMAGE asset ID for a motion photo hidden video."""
+        if not original_file_name:
+            try:
+                info = self._request("GET", f"/api/assets/{video_id}")
+                original_file_name = info.get("originalFileName") if isinstance(info, dict) else None
+            except Exception:
+                pass
+
+        if original_file_name:
+            stem = Path(original_file_name).stem
+            if stem.endswith(".MV") or stem.endswith("_MP"):
+                stem = stem[:-3]
+            try:
+                res = self._request("POST", "/api/search/metadata", {"originalFileName": stem})
+                assets = res.get("assets", {}).get("items", []) if isinstance(res, dict) else []
+                for a in assets:
+                    if a.get("livePhotoVideoId") == video_id or (a.get("type") == "IMAGE" and stem in a.get("originalFileName", "")):
+                        return a.get("id")
+            except Exception:
+                pass
+        return None
+
+    def add_assets_to_album(self, album_id: str, asset_ids: List[str]) -> Tuple[int, List[str]]:
+        """
+        Adds asset IDs to an album in batches of 500.
+        If an asset is rejected because it is a hidden motion photo video companion,
+        automatically resolves its parent image asset and adds it instead.
+        Returns (added_count, success_asset_ids).
+        """
         batch_size = 500
+        success_ids: List[str] = []
         for i in range(0, len(asset_ids), batch_size):
             batch = asset_ids[i:i + batch_size]
-            self._request("PUT", f"/api/albums/{album_id}/assets", {"ids": batch})
+            res = self._request("PUT", f"/api/albums/{album_id}/assets", {"ids": batch})
+            if isinstance(res, list):
+                failed_items = []
+                for item in res:
+                    if isinstance(item, dict):
+                        if item.get("success"):
+                            success_ids.append(item.get("id"))
+                        else:
+                            failed_items.append(item)
+
+                if failed_items:
+                    parent_ids_to_retry = []
+                    for item in failed_items:
+                        vid = item.get("id")
+                        if vid:
+                            parent_id = self.find_parent_motion_photo(vid)
+                            if parent_id:
+                                parent_ids_to_retry.append(parent_id)
+                    if parent_ids_to_retry:
+                        retry_res = self._request("PUT", f"/api/albums/{album_id}/assets", {"ids": parent_ids_to_retry})
+                        if isinstance(retry_res, list):
+                            for r in retry_res:
+                                if isinstance(r, dict) and r.get("success"):
+                                    success_ids.append(r.get("id"))
+            else:
+                success_ids.extend(batch)
+        return len(success_ids), success_ids
 
     def get_assets_total_size(self, asset_ids: Set[str], max_workers: int = 20) -> int:
         """Calculates exact total file size in bytes for a set of asset IDs."""

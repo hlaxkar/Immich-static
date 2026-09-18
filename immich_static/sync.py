@@ -24,6 +24,7 @@ def sync_immich(
     sync_tags: bool = True,
     sync_albums: bool = True,
     include_dynamic: bool = False,
+    prune: bool = False,
 ):
     """Syncs classified assets from SQLite checkpoint to Immich Tags and Albums."""
     # 1. Fetch Immich Assets & Build Lookup Maps
@@ -44,6 +45,14 @@ def sync_immich(
 
         if orig_name:
             name_to_assets.setdefault(orig_name, []).append(asset)
+
+    # Prune orphaned records if requested
+    if prune:
+        active_aids = {a["id"] for a in immich_videos}
+        active_fns = set(path_to_asset.keys())
+        pruned_count = ckpt.prune_missing(active_aids, active_fns)
+        if pruned_count > 0:
+            print(f"🧹 Pruned {pruned_count} orphaned checkpoint record(s) no longer in Immich.\n")
 
     # 2. Match Checkpoint Entries
     all_rows = ckpt.all_rows()
@@ -99,7 +108,8 @@ def sync_immich(
 
     print(f"🔗 Match Results:")
     print(f"   • Matched Immich Assets : {matched_count}")
-    print(f"   • Unmatched Local Files : {unmatched_count}")
+    if unmatched_count > 0:
+        print(f"   • Unmatched/Deleted     : {unmatched_count} (in DB, not in Immich)")
     print(f"   • Static candidates     : {len(grouped_asset_ids['static'])}")
     print(f"   • Review candidates     : {len(grouped_asset_ids['review'])}")
     if include_dynamic:
@@ -174,7 +184,14 @@ def sync_immich(
                 album_id = album["id"]
                 existing_in_album = client.get_album_assets(album_id) if not dry_run else set()
 
-            to_add = [aid for aid in asset_ids if aid not in existing_in_album]
+            to_add = []
+            for aid in asset_ids:
+                if aid in existing_in_album:
+                    continue
+                parent_id = client.find_parent_motion_photo(aid) if not dry_run else None
+                if parent_id and parent_id in existing_in_album:
+                    continue
+                to_add.append(aid)
 
             print(f"   📦 Album '{target_album_name}':")
             print(f"      • Total classified : {len(asset_ids)}")
@@ -185,8 +202,8 @@ def sync_immich(
                 if dry_run:
                     print(f"      🔍 [DRY-RUN] Would add {len(to_add)} assets to '{target_album_name}'")
                 else:
-                    client.add_assets_to_album(album_id, to_add)
-                    print(f"      ✅ Added {len(to_add)} assets to '{target_album_name}'.")
+                    added_count, _ = client.add_assets_to_album(album_id, to_add)
+                    print(f"      ✅ Added {added_count} assets to '{target_album_name}'.")
         print()
 
 
@@ -419,11 +436,14 @@ def display_storage_stats(
                 except Exception:
                     dur_s = 0.0
 
-            if aid in static_ids:
+            ckpt_row = ckpt._cache_by_asset_id.get(aid) if ckpt else None
+            ckpt_dec = ckpt_row.get("decision") if ckpt_row else None
+
+            if aid in static_ids or (ckpt_dec == "static" and static_album):
                 cat = "static"
-            elif aid in review_ids:
+            elif aid in review_ids or (ckpt_dec == "review" and review_album):
                 cat = "review"
-            elif aid in dynamic_ids:
+            elif aid in dynamic_ids or (ckpt_dec == "dynamic" and dynamic_album):
                 cat = "dynamic"
             else:
                 cat = "other"
@@ -624,6 +644,7 @@ def run_sync(args: Any):
         sync_tags=sync_tags,
         sync_albums=sync_albums,
         include_dynamic=include_dynamic,
+        prune=getattr(args, "prune", False),
     )
     display_storage_stats(client=client, ckpt=ckpt)
 
