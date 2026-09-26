@@ -21,25 +21,84 @@ from typing import Any, Dict, List, Optional, Tuple
 # AUTO-LOAD .ENV FILE IF PRESENT
 # ─────────────────────────────────────────────
 
-def load_dotenv():
-    """Loads key-value pairs from .env file into os.environ if not already set."""
+def get_project_root() -> Path:
+    """Returns the resolved project root directory."""
+    pkg_dir = Path(__file__).resolve().parent
     candidates = [
-        Path(".env"),
-        Path(__file__).resolve().parent.parent / ".env",
-        Path.home() / ".config" / "immich-static" / ".env",
+        pkg_dir.parent,
+        Path.cwd(),
     ]
-    for env_file in candidates:
-        if env_file.exists():
-            with open(env_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    k, v = line.split("=", 1)
-                    k, v = k.strip(), v.strip().strip("'\"")
-                    if k and k not in os.environ:
-                        os.environ[k] = v
+    for c in candidates:
+        if (c / "immich_static").is_dir() or (c / ".git").is_dir():
+            return c.resolve()
+    return pkg_dir.parent.resolve()
+
+
+def load_dotenv(dotenv_path: Optional[Path] = None):
+    """
+    Loads key-value pairs from .env files into os.environ if not already set.
+    Searches current directory, package project root, user config, and parent directories.
+    Resolves relative path variables (DB_PATH, EXTRACT_OUTPUT_DIR) to absolute paths.
+    """
+    pkg_root = get_project_root()
+
+    candidates: List[Path] = []
+    if dotenv_path:
+        candidates.append(Path(dotenv_path).resolve())
+
+    # 1. Current working directory .env
+    candidates.append(Path.cwd() / ".env")
+    # 2. Package / project root .env (where immich-static repo is located)
+    candidates.append(pkg_root / ".env")
+    # 3. User configuration directory ~/.config/immich-static/.env
+    candidates.append(Path.home() / ".config" / "immich-static" / ".env")
+    # 4. User home directory fallback
+    candidates.append(Path.home() / ".immich-static.env")
+
+    # 5. Search upwards from cwd to home directory
+    curr = Path.cwd().resolve()
+    for parent in curr.parents:
+        if parent == Path.home() or parent == Path("/"):
             break
+        cand = parent / ".env"
+        if cand not in candidates:
+            candidates.append(cand)
+
+    for env_file in candidates:
+        if env_file.is_file():
+            try:
+                base_dir = env_file.resolve().parent
+                with open(env_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        k, v = line.split("=", 1)
+                        k, v = k.strip(), v.strip().strip("'\"")
+                        if not k:
+                            continue
+
+                        # Resolve relative paths in .env to absolute paths based on .env location
+                        if k in ("DB_PATH", "EXTRACT_OUTPUT_DIR") and v and not os.path.isabs(v):
+                            v = str((base_dir / v).resolve())
+
+                        if k not in os.environ:
+                            os.environ[k] = v
+            except Exception:
+                pass
+
+    # Bidirectional alias support: IMMICH_URL <-> IMMICH_API_URL
+    if "IMMICH_API_URL" not in os.environ and "IMMICH_URL" in os.environ:
+        os.environ["IMMICH_API_URL"] = os.environ["IMMICH_URL"]
+    if "IMMICH_URL" not in os.environ and "IMMICH_API_URL" in os.environ:
+        os.environ["IMMICH_URL"] = os.environ["IMMICH_API_URL"]
+
+    # Provide absolute fallback paths for DB and extracted frames if not defined
+    if "DB_PATH" not in os.environ:
+        os.environ["DB_PATH"] = str((pkg_root / CHECKPOINT_FILENAME).resolve())
+    if "EXTRACT_OUTPUT_DIR" not in os.environ:
+        os.environ["EXTRACT_OUTPUT_DIR"] = str((pkg_root / "extracted_frames").resolve())
+
 
 load_dotenv()
 
