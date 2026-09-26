@@ -25,25 +25,29 @@ def generate_synthetic_videos():
     static_mp4 = TEST_DIR / "test_static.mp4"
     dynamic_mp4 = TEST_DIR / "test_dynamic.mp4"
 
-    # 1. Generate Static Video (a solid color slide with text for 3 seconds)
+    # 1. Generate Static Video (representative 9:16 vertical slide with audio track for 10 seconds)
     print("🎬 Generating synthetic static video...")
     cmd_static = [
         "ffmpeg", "-y",
         "-f", "lavfi",
-        "-i", "color=c=navy:s=640x360:d=3:r=25",
+        "-i", "color=c=navy:s=360x640:d=10:r=25",
+        "-f", "lavfi",
+        "-i", "anullsrc=r=44100:cl=stereo",
         "-vf", "drawtext=text='STATIC SLIDE':fontcolor=white:fontsize=32:x=(w-text_w)/2:y=(h-text_h)/2",
+        "-c:v", "libx264",
+        "-c:a", "aac",
+        "-shortest",
         "-pix_fmt", "yuv420p",
         str(static_mp4)
     ]
     subprocess.run(cmd_static, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # 2. Generate High-Motion Dynamic Video (rapid scrolling full-frame pattern for 3 seconds)
+    # 2. Generate High-Motion Dynamic Video (active motion with moving elements and changing patterns)
     print("🎬 Generating synthetic dynamic video...")
     cmd_dynamic = [
         "ffmpeg", "-y",
         "-f", "lavfi",
-        "-i", "smptebars=size=640x360:rate=25:duration=3",
-        "-vf", "scroll=horizontal=0.2",
+        "-i", "testsrc2=size=640x360:rate=25:duration=5",
         "-pix_fmt", "yuv420p",
         str(dynamic_mp4)
     ]
@@ -66,9 +70,9 @@ def run_tests():
         print("\n--- Test 1: Video Metadata Probe ---")
         meta_static = get_video_metadata(static_vid)
         print(f"Static video: {meta_static['width']}x{meta_static['height']}, {meta_static['duration']}s, {meta_static['fps']}fps")
-        assert meta_static["width"] == 640
-        assert meta_static["height"] == 360
-        assert abs(meta_static["duration"] - 3.0) < 0.5
+        assert meta_static["width"] == 360
+        assert meta_static["height"] == 640
+        assert abs(meta_static["duration"] - 10.0) < 0.5
         print("✅ Metadata probe passed!")
 
         # Test 2: Detection on Static Video

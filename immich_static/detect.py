@@ -50,14 +50,15 @@ def print_report(rows: List[Dict[str, Any]]):
         group.sort(key=lambda r: float(r.get("final_confidence") or 0), reverse=True)
         label = {"static": "🖼  STATIC", "review": "🔍 REVIEW", "dynamic": "🎥 DYNAMIC"}[d]
         print(f"\n{label} ({len(group)})")
-        print(f"  {'filename':<50} {'conf':>6}  {'motion':>7}  {'zones':>6}  {'dur':>6}")
-        print(f"  {'─'*50} {'─'*6}  {'─'*7}  {'─'*6}  {'─'*6}")
+        print(f"  {'filename':<45} {'conf':>6}  {'motion':>7}  {'zones':>6}  {'heur':>6}  {'dur':>6}")
+        print(f"  {'─'*45} {'─'*6}  {'─'*7}  {'─'*6}  {'─'*6}  {'─'*6}")
         for r in group[:30]:
             print(
-                f"  {r.get('filename','')[-50:]:<50} "
+                f"  {r.get('filename','')[-45:]:<45} "
                 f"{r.get('final_confidence','?'):>6}  "
                 f"{r.get('global_motion_score','?'):>7}  "
                 f"{r.get('active_zone_ratio','?'):>6}  "
+                f"{r.get('heuristic_score','?'):>6}  "
                 f"{r.get('duration_s','?'):>6}s"
             )
         if len(group) > 30:

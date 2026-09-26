@@ -65,6 +65,12 @@ VIDEO_EXTENSIONS = frozenset({
 
 CHECKPOINT_FILENAME = "detection_checkpoint.sqlite"
 
+# Analysis parameters matching StaticSorter
+ANALYSIS_WIDTH = 320
+GRID_ROWS = 6
+GRID_COLS = 6
+ZONE_MOTION_THRESH = 5.0
+
 LOG_FIELDS = [
     "filename",
     "original_file_name",
@@ -74,6 +80,7 @@ LOG_FIELDS = [
     "global_motion_score",
     "active_zone_ratio",
     "max_zone_motion",
+    "heuristic_score",
     "duration_s",
     "width",
     "height",
@@ -82,25 +89,59 @@ LOG_FIELDS = [
     "error",
 ]
 
-SENSITIVITY_PRESETS = {
-    "low": {
-        "static_max_motion": 0.015,
-        "static_max_active_zones": 0.06,
-        "review_max_motion": 0.040,
-        "review_max_active_zones": 0.15,
-    },
-    "medium": {
-        "static_max_motion": 0.028,
-        "static_max_active_zones": 0.12,
-        "review_max_motion": 0.065,
-        "review_max_active_zones": 0.25,
-    },
-    "high": {
-        "static_max_motion": 0.045,
-        "static_max_active_zones": 0.18,
-        "review_max_motion": 0.095,
-        "review_max_active_zones": 0.35,
-    },
+
+class SensitivityConfig:
+    """Thresholds for detection sensitivity levels matching StaticSorter."""
+    def __init__(
+        self,
+        global_motion_static: float,
+        global_motion_review: float,
+        active_zone_ratio: float,
+        confidence_static: float,
+        confidence_review: float,
+    ):
+        self.global_motion_static = float(global_motion_static)
+        self.global_motion_review = float(global_motion_review)
+        self.active_zone_ratio = float(active_zone_ratio)
+        self.confidence_static = float(confidence_static)
+        self.confidence_review = float(confidence_review)
+
+    def __getitem__(self, item: str) -> Any:
+        return getattr(self, item)
+
+    def get(self, item: str, default: Any = None) -> Any:
+        return getattr(self, item, default)
+
+    def __repr__(self) -> str:
+        return (
+            f"SensitivityConfig(static_motion<={self.global_motion_static}, "
+            f"review_motion<={self.global_motion_review}, active_zones<={self.active_zone_ratio}, "
+            f"conf_static>={self.confidence_static}, conf_review>={self.confidence_review})"
+        )
+
+
+SENSITIVITY_PRESETS: Dict[str, SensitivityConfig] = {
+    "low": SensitivityConfig(
+        global_motion_static=3.0,
+        global_motion_review=8.0,
+        active_zone_ratio=0.30,
+        confidence_static=0.75,
+        confidence_review=0.45,
+    ),
+    "medium": SensitivityConfig(
+        global_motion_static=4.5,
+        global_motion_review=12.0,
+        active_zone_ratio=0.25,
+        confidence_static=0.65,
+        confidence_review=0.40,
+    ),
+    "high": SensitivityConfig(
+        global_motion_static=7.0,
+        global_motion_review=18.0,
+        active_zone_ratio=0.35,
+        confidence_static=0.55,
+        confidence_review=0.35,
+    ),
 }
 
 
@@ -312,54 +353,78 @@ def get_video_metadata(video_path: Path) -> Dict[str, Any]:
     }
 
 
+def sample_count_for_duration(duration: float) -> int:
+    """Determine number of frames to sample during classification matching StaticSorter."""
+    if duration < 3:
+        return 2
+    if duration < 5:
+        return 3
+    if duration < 10:
+        return 4
+    if duration < 30:
+        return 5
+    if duration < 60:
+        return 8
+    return 16
+
+
 def extract_sparse_frames(
     video_path: Path,
     duration: float,
-    num_samples: int = 10,
-    max_dimension: int = 360
+    count: Optional[int] = None,
+    target_width: int = ANALYSIS_WIDTH,
 ) -> List[Any]:
     """
     Extracts sparse downscaled frames for rapid motion analysis.
-    Uses OpenCV / FFmpeg to read timestamps evenly spaced across video.
+    Uses 5% edge margin trimming and evenly spaced timestamps matching StaticSorter.
     """
     import cv2
 
     if duration <= 0:
         duration = 1.0
 
-    timestamps = [duration * (i + 0.5) / num_samples for i in range(num_samples)]
+    num_samples = count if count is not None else sample_count_for_duration(duration)
+
+    margin = max(0.5, duration * 0.05)
+    t_start = margin
+    t_end = max(t_start + 1.0, duration - margin)
+
+    if num_samples <= 1:
+        timestamps = [(t_start + t_end) / 2.0]
+    else:
+        step = (t_end - t_start) / (num_samples - 1)
+        timestamps = [t_start + i * step for i in range(num_samples)]
+
     frames = []
-
     cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {video_path}")
-
-    try:
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        for ts in timestamps:
-            cap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000.0)
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                frame_idx = int(ts * fps)
-                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    if cap.isOpened():
+        try:
+            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            for ts in timestamps:
+                cap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000.0)
                 ret, frame = cap.read()
+                if not ret or frame is None:
+                    frame_idx = int(ts * fps)
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                    ret, frame = cap.read()
 
-            if ret and frame is not None:
-                h, w = frame.shape[:2]
-                if max(h, w) > max_dimension:
-                    scale = max_dimension / max(h, w)
-                    frame = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-                frames.append(frame)
-    finally:
-        cap.release()
+                if ret and frame is not None:
+                    h, w = frame.shape[:2]
+                    if w > 0 and h > 0:
+                        scale = target_width / w
+                        new_h = max(1, int(h * scale))
+                        frame = cv2.resize(frame, (target_width, new_h), interpolation=cv2.INTER_AREA)
+                    frames.append(frame)
+        finally:
+            cap.release()
 
     if len(frames) < 2:
-        frames = _ffmpeg_extract_sparse(video_path, timestamps, max_dimension)
+        frames = _ffmpeg_extract_sparse(video_path, timestamps, target_width)
 
     return frames
 
 
-def _ffmpeg_extract_sparse(video_path: Path, timestamps: List[float], max_dimension: int = 360) -> List[Any]:
+def _ffmpeg_extract_sparse(video_path: Path, timestamps: List[float], target_width: int = ANALYSIS_WIDTH) -> List[Any]:
     """Fallback sparse extractor using FFmpeg CLI pipe."""
     import cv2
     import numpy as np
@@ -371,7 +436,7 @@ def _ffmpeg_extract_sparse(video_path: Path, timestamps: List[float], max_dimens
             "-ss", f"{ts:.3f}",
             "-i", str(video_path),
             "-vframes", "1",
-            "-vf", f"scale='min({max_dimension},iw)':-2",
+            "-vf", f"scale={target_width}:-2",
             "-f", "image2pipe",
             "-vcodec", "png",
             "-"
@@ -386,81 +451,191 @@ def _ffmpeg_extract_sparse(video_path: Path, timestamps: List[float], max_dimens
 
 
 # ─────────────────────────────────────────────
-# MOTION DETECTION & GRID ANALYSIS
+# 3-LAYER DETECTION & GRID ANALYSIS (STATICSORTER ENGINE)
 # ─────────────────────────────────────────────
 
-def analyze_motion(frames: List[Any], grid_size: int = 4) -> Tuple[float, float, float]:
+def compute_global_motion(frames: List[Any]) -> float:
     """
-    Analyzes motion between consecutive downscaled frames.
-    Returns:
-      (global_motion_score, active_zone_ratio, max_zone_motion)
+    Layer 1: Compute average pixel intensity difference across consecutive frames (0-255 scale).
     """
     import cv2
     import numpy as np
 
     if len(frames) < 2:
-        return 0.0, 0.0, 0.0
+        return 0.0
 
-    gray_frames = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames]
-    h, w = gray_frames[0].shape
+    grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) if len(f.shape) == 3 else f for f in frames]
+    diffs = []
+    for i in range(len(grays) - 1):
+        diff = cv2.absdiff(grays[i], grays[i + 1])
+        diffs.append(float(np.mean(diff)))
 
-    cell_h = h // grid_size
-    cell_w = w // grid_size
-
-    diff_scores = []
-    zone_motions = np.zeros((grid_size, grid_size), dtype=np.float32)
-
-    for i in range(len(gray_frames) - 1):
-        prev = gray_frames[i]
-        curr = gray_frames[i + 1]
-
-        diff = cv2.absdiff(curr, prev) / 255.0
-        global_diff = float(np.mean(diff))
-        diff_scores.append(global_diff)
-
-        for r in range(grid_size):
-            for c in range(grid_size):
-                zone = diff[r * cell_h : (r + 1) * cell_h, c * cell_w : (c + 1) * cell_w]
-                zone_motions[r, c] += float(np.mean(zone))
-
-    num_transitions = len(gray_frames) - 1
-    if num_transitions > 0:
-        zone_motions /= num_transitions
-
-    global_motion = float(np.mean(diff_scores))
-    max_zone_motion = float(np.max(zone_motions))
-
-    zone_active_threshold = 0.035
-    active_zones = np.sum(zone_motions > zone_active_threshold)
-    active_zone_ratio = float(active_zones / (grid_size * grid_size))
-
-    return round(global_motion, 4), round(active_zone_ratio, 3), round(max_zone_motion, 4)
+    return float(np.mean(diffs)) if diffs else 0.0
 
 
-def evaluate_decision(global_motion: float, active_ratio: float, thresholds: Dict[str, float]) -> Tuple[str, str]:
-    """Evaluates motion metrics against sensitivity preset thresholds."""
-    static_max_m = thresholds["static_max_motion"]
-    static_max_z = thresholds["static_max_active_zones"]
-    review_max_m = thresholds["review_max_motion"]
-    review_max_z = thresholds["review_max_active_zones"]
+def compute_spatial_zone_ratio(
+    frames: List[Any],
+    rows: int = GRID_ROWS,
+    cols: int = GRID_COLS,
+    thresh: float = ZONE_MOTION_THRESH,
+) -> Tuple[float, float]:
+    """
+    Layer 2: Divide frame into 6x6 grid (36 zones) and compute fraction of active motion zones.
+    Returns: (active_zone_ratio, max_zone_motion)
+    """
+    import cv2
+    import numpy as np
 
-    if global_motion <= static_max_m and active_ratio <= static_max_z:
+    if len(frames) < 2:
+        return 0.0, 0.0
+
+    grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) if len(f.shape) == 3 else f for f in frames]
+    h, w = grays[0].shape[:2]
+    cell_h = h // rows
+    cell_w = w // cols
+
+    if cell_h == 0 or cell_w == 0:
+        return 0.0, 0.0
+
+    active_zones = 0
+    total_zones = rows * cols
+    max_zone_motion = 0.0
+
+    for r in range(rows):
+        for c in range(cols):
+            y1 = r * cell_h
+            y2 = (r + 1) * cell_h if r < rows - 1 else h
+            x1 = c * cell_w
+            x2 = (c + 1) * cell_w if c < cols - 1 else w
+
+            cell_diffs = []
+            for i in range(len(grays) - 1):
+                crop_prev = grays[i][y1:y2, x1:x2]
+                crop_curr = grays[i + 1][y1:y2, x1:x2]
+                diff = cv2.absdiff(crop_prev, crop_curr)
+                cell_diffs.append(float(np.mean(diff)))
+
+            if cell_diffs:
+                avg_zone_motion = float(np.mean(cell_diffs))
+                if avg_zone_motion > max_zone_motion:
+                    max_zone_motion = avg_zone_motion
+                if avg_zone_motion > thresh:
+                    active_zones += 1
+
+    active_ratio = active_zones / total_zones if total_zones > 0 else 0.0
+    return round(active_ratio, 3), round(max_zone_motion, 4)
+
+
+def compute_heuristics(meta: Any) -> float:
+    """
+    Layer 3: Score likelihood of being a static repost/visualizer from metadata signals.
+    """
+    import numpy as np
+
+    score = 0.5  # Neutral baseline
+
+    aspect_ratio = getattr(meta, "aspect_ratio", None) or (meta.get("aspect_ratio") if isinstance(meta, dict) else "unknown")
+    has_audio = getattr(meta, "has_audio", False) if hasattr(meta, "has_audio") else (meta.get("has_audio", False) if isinstance(meta, dict) else False)
+    duration_s = getattr(meta, "duration_s", 0.0) if hasattr(meta, "duration_s") else (meta.get("duration", 0.0) if isinstance(meta, dict) else 0.0)
+    codec = (getattr(meta, "codec", "") or (meta.get("codec", "") if isinstance(meta, dict) else "")).lower()
+
+    # Aspect ratio signals (Instagram Reels / TikTok / Square reposts)
+    if aspect_ratio in ("9:16", "1:1", "4:5"):
+        score += 0.20
+    elif aspect_ratio == "16:9":
+        score -= 0.10
+
+    # Audio presence (often static music visualizers or reposts have audio)
+    if has_audio:
+        score += 0.15
+    else:
+        score -= 0.15
+
+    # Duration signals
+    if 5.0 <= duration_s <= 600.0:
+        score += 0.10
+    elif duration_s > 1800.0:  # > 30 mins
+        score -= 0.20
+
+    # Codec signals
+    if codec in ("h264", "hevc", "av1", "vp9"):
+        score += 0.05
+
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def compute_confidence(
+    global_motion: float,
+    zone_ratio: float,
+    heuristic: float,
+    cfg: SensitivityConfig,
+    duration: float = 0.0,
+) -> float:
+    """
+    Combine scores into a single confidence rating (0.0 to 1.0) with freeze-frame penalties.
+    """
+    import numpy as np
+
+    # 1. Motion score: 0 motion -> 1.0, >= review_thresh -> 0.0
+    if global_motion <= 0.0:
+        motion_conf = 1.0
+    elif global_motion >= cfg.global_motion_review:
+        motion_conf = 0.0
+    else:
+        motion_conf = 1.0 - (global_motion / cfg.global_motion_review)
+
+    # 2. Spatial zone score: 0 active zones -> 1.0, >= active_zone_ratio * 1.5 -> 0.0
+    zone_thresh = cfg.active_zone_ratio * 1.5
+    if zone_ratio <= 0.0:
+        zone_conf = 1.0
+    elif zone_ratio >= zone_thresh:
+        zone_conf = 0.0
+    else:
+        zone_conf = 1.0 - (zone_ratio / zone_thresh)
+
+    # Weighted average: 50% global motion, 30% spatial zones, 20% heuristics
+    conf = (motion_conf * 0.50) + (zone_conf * 0.30) + (heuristic * 0.20)
+
+    # Penalty for very short clips (< 10s) to guard against transient freeze-frames
+    if 0 < duration < 5.0:
+        conf *= 0.70
+    elif 0 < duration < 10.0:
+        conf *= 0.85
+
+    return float(np.clip(conf, 0.0, 1.0))
+
+
+def evaluate_decision(conf: float, cfg: SensitivityConfig) -> Tuple[str, str]:
+    """Evaluates final confidence against preset thresholds."""
+    if conf >= cfg.confidence_static:
         decision = "static"
-        conf = max(0.6, 1.0 - (global_motion / static_max_m) * 0.4)
-    elif global_motion <= review_max_m or active_ratio <= review_max_z:
+    elif conf >= cfg.confidence_review:
         decision = "review"
-        conf = 0.5 + 0.3 * (1.0 - min(1.0, global_motion / review_max_m))
     else:
         decision = "dynamic"
-        conf = min(0.99, 0.6 + (global_motion / (review_max_m * 2)) * 0.4)
 
     return decision, f"{conf:.2f}"
 
 
-def detect_video(video_path: Path, thresholds: Dict[str, float], debug: bool = False) -> Dict[str, Any]:
+def detect_video(
+    video_path: Path,
+    cfg: Any = "medium",
+    debug: bool = False
+) -> Dict[str, Any]:
     """
-    Performs full detection and classification on a single video file.
+    Full pipeline to probe, sample, and classify a single video item matching StaticSorter.
     """
+    if isinstance(cfg, str):
+        cfg = SENSITIVITY_PRESETS.get(cfg, SENSITIVITY_PRESETS["medium"])
+    elif isinstance(cfg, dict) and not isinstance(cfg, SensitivityConfig):
+        cfg = SensitivityConfig(
+            global_motion_static=float(cfg.get("global_motion_static", 4.5)),
+            global_motion_review=float(cfg.get("global_motion_review", 12.0)),
+            active_zone_ratio=float(cfg.get("active_zone_ratio", 0.25)),
+            confidence_static=float(cfg.get("confidence_static", 0.65)),
+            confidence_review=float(cfg.get("confidence_review", 0.40)),
+        )
+
     result: Dict[str, Any] = {
         "filename": str(video_path),
         "asset_id": "",
@@ -469,6 +644,7 @@ def detect_video(video_path: Path, thresholds: Dict[str, float], debug: bool = F
         "global_motion_score": "0.0",
         "active_zone_ratio": "0.0",
         "max_zone_motion": "0.0",
+        "heuristic_score": "0.0",
         "duration_s": "0.0",
         "width": 0,
         "height": 0,
@@ -478,14 +654,19 @@ def detect_video(video_path: Path, thresholds: Dict[str, float], debug: bool = F
     }
 
     try:
-        meta = get_video_metadata(video_path)
-        result["duration_s"] = str(meta["duration"])
-        result["width"] = meta["width"]
-        result["height"] = meta["height"]
-        result["fps"] = meta["fps"]
+        from immich_static.exif import probe_video
+        meta = probe_video(video_path)
+        result["duration_s"] = str(round(meta.duration_s, 2))
+        result["width"] = meta.width
+        result["height"] = meta.height
+        result["fps"] = round(meta.fps, 2)
 
-        num_samples = 10 if meta["duration"] <= 60 else min(15, int(meta["duration"] / 4))
-        frames = extract_sparse_frames(video_path, meta["duration"], num_samples=num_samples)
+        if meta.duration_s <= 0 and meta.width == 0:
+            result["decision"] = "error: probe failed"
+            result["error"] = "Failed to probe video stream/duration"
+            return result
+
+        frames = extract_sparse_frames(video_path, meta.duration_s)
         result["frames_sampled"] = len(frames)
 
         if len(frames) < 2:
@@ -493,14 +674,18 @@ def detect_video(video_path: Path, thresholds: Dict[str, float], debug: bool = F
             result["error"] = "Insufficient frames extracted"
             return result
 
-        global_motion, active_ratio, max_zone = analyze_motion(frames)
-        result["global_motion_score"] = f"{global_motion:.4f}"
-        result["active_zone_ratio"] = f"{active_ratio:.3f}"
-        result["max_zone_motion"] = f"{max_zone:.4f}"
+        g_motion = compute_global_motion(frames)
+        z_ratio, max_z = compute_spatial_zone_ratio(frames)
+        heur = compute_heuristics(meta)
+        conf = compute_confidence(g_motion, z_ratio, heur, cfg, duration=meta.duration_s)
+        decision, conf_str = evaluate_decision(conf, cfg)
 
-        decision, confidence = evaluate_decision(global_motion, active_ratio, thresholds)
+        result["global_motion_score"] = f"{g_motion:.2f}"
+        result["active_zone_ratio"] = f"{z_ratio:.2f}"
+        result["max_zone_motion"] = f"{max_z:.2f}"
+        result["heuristic_score"] = f"{heur:.2f}"
+        result["final_confidence"] = conf_str
         result["decision"] = decision
-        result["final_confidence"] = confidence
 
     except Exception as e:
         result["decision"] = f"error: {e}"
@@ -765,6 +950,7 @@ class Checkpoint:
                     global_motion_score TEXT,
                     active_zone_ratio TEXT,
                     max_zone_motion TEXT,
+                    heuristic_score TEXT,
                     duration_s TEXT,
                     width INTEGER,
                     height INTEGER,
@@ -776,6 +962,10 @@ class Checkpoint:
             """)
             try:
                 conn.execute("ALTER TABLE videos ADD COLUMN original_file_name TEXT")
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE videos ADD COLUMN heuristic_score TEXT")
             except Exception:
                 pass
             conn.execute("CREATE INDEX IF NOT EXISTS idx_videos_filename ON videos(filename)")
@@ -821,9 +1011,9 @@ class Checkpoint:
                 conn.execute("""
                     INSERT OR REPLACE INTO videos (
                         asset_id, filename, original_file_name, decision, final_confidence,
-                        global_motion_score, active_zone_ratio, max_zone_motion,
+                        global_motion_score, active_zone_ratio, max_zone_motion, heuristic_score,
                         duration_s, width, height, fps, frames_sampled, error
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     aid,
                     fn,
@@ -833,6 +1023,7 @@ class Checkpoint:
                     str(data.get("global_motion_score", "")),
                     str(data.get("active_zone_ratio", "")),
                     str(data.get("max_zone_motion", "")),
+                    str(data.get("heuristic_score", "")),
                     str(data.get("duration_s", "")),
                     int(data.get("width") or 0),
                     int(data.get("height") or 0),

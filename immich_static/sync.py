@@ -303,11 +303,8 @@ def sync_immich(
 
 def restore_checkpoint_decisions(ckpt: Checkpoint, sensitivity: str = "medium") -> int:
     """Restores classifications in SQLite checkpoint database from recorded motion scores."""
+    from immich_static.core import compute_confidence, evaluate_decision
     thresholds = SENSITIVITY_PRESETS.get(sensitivity, SENSITIVITY_PRESETS["medium"])
-    static_max_m = thresholds["static_max_motion"]
-    static_max_z = thresholds["static_max_active_zones"]
-    review_max_m = thresholds["review_max_motion"]
-    review_max_z = thresholds["review_max_active_zones"]
 
     rows = ckpt.all_rows()
     restored_counts = {"static": 0, "review": 0, "dynamic": 0}
@@ -320,15 +317,13 @@ def restore_checkpoint_decisions(ckpt: Checkpoint, sensitivity: str = "medium") 
         try:
             global_motion = float(g_str)
             active_ratio = float(z_str)
+            heur = float(r.get("heuristic_score") or 0.5)
+            duration = float(r.get("duration_s") or 0.0)
         except (ValueError, TypeError):
             continue
 
-        if global_motion <= static_max_m and active_ratio <= static_max_z:
-            new_dec = "static"
-        elif global_motion <= review_max_m or active_ratio <= review_max_z:
-            new_dec = "review"
-        else:
-            new_dec = "dynamic"
+        conf = compute_confidence(global_motion, active_ratio, heur, thresholds, duration=duration)
+        new_dec, conf_str = evaluate_decision(conf, thresholds)
 
         aid = r.get("asset_id")
         fn = r.get("filename")
