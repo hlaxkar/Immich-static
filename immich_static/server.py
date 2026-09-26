@@ -448,7 +448,14 @@ def run_serve(args: Any):
     port = int(getattr(args, "port", None) or os.environ.get("WEBHOOK_PORT", 8080))
     secret = getattr(args, "secret", None) or os.environ.get("WEBHOOK_SECRET")
 
-    folder_str = getattr(args, "folder", None) or os.environ.get("IMMICH_LIBRARY_PATH")
+    raw_folder = getattr(args, "folder", None)
+    if raw_folder in ("status", "stop", "start", "restart", "logs", "install", "uninstall"):
+        print(f"⚠️  Did you mean 'immich-static service {raw_folder}'?")
+        print(f"   • 'immich-static serve' runs the webhook daemon directly in the foreground.")
+        print(f"   • 'immich-static service {raw_folder}' controls the background systemd service.\n")
+        sys.exit(1)
+
+    folder_str = raw_folder or os.environ.get("IMMICH_LIBRARY_PATH")
     folder = Path(folder_str).resolve() if folder_str else None
 
     remote_prefix = getattr(args, "remote_prefix", None) or os.environ.get("IMMICH_REMOTE_PATH_PREFIX")
@@ -482,21 +489,31 @@ def run_serve(args: Any):
         print(f"❌ Could not connect to Immich API: {e}")
         sys.exit(1)
 
-    server = WebhookServer(
-        (host, port),
-        WebhookRequestHandler,
-        client=client,
-        ckpt=ckpt,
-        thresholds=thresholds,
-        folder=folder,
-        remote_prefix=remote_prefix,
-        local_prefix=local_prefix,
-        secret=secret,
-        include_dynamic=include_dynamic,
-        extract_frame=extract_frame,
-        extract_dir=extract_dir,
-        dry_run=dry_run,
-    )
+    try:
+        server = WebhookServer(
+            (host, port),
+            WebhookRequestHandler,
+            client=client,
+            ckpt=ckpt,
+            thresholds=thresholds,
+            folder=folder,
+            remote_prefix=remote_prefix,
+            local_prefix=local_prefix,
+            secret=secret,
+            include_dynamic=include_dynamic,
+            extract_frame=extract_frame,
+            extract_dir=extract_dir,
+            dry_run=dry_run,
+        )
+    except OSError as e:
+        if e.errno == 98 or "already in use" in str(e).lower():
+            print(f"\n❌ Error: Port {port} is already in use by another process.")
+            print(f"   • If immich-static is running as a systemd service, manage it with:")
+            print(f"       immich-static service status")
+            print(f"       immich-static service stop")
+            print(f"   • Or specify a different port with: --port <PORT>\n")
+            sys.exit(1)
+        raise
 
     # Start background worker threads
     worker_threads = []

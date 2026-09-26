@@ -520,95 +520,144 @@ def calculate_sharpness(image: Any) -> float:
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
+def pick_best_frame(frames: List[Any]) -> int:
+    """
+    Selects the index of the highest quality frame:
+    - High sharpness (Laplacian variance)
+    - Low local motion relative to neighbors (calmness)
+    - Excludes first and last frames to avoid fade-in/fade-out artifacts.
+    Composite score: 60% calmness, 40% sharpness.
+    """
+    import cv2
+    import numpy as np
+
+    n = len(frames)
+    if n <= 1:
+        return 0
+    if n == 2:
+        return 0
+
+    motion = np.zeros(n, dtype=np.float64)
+    sharp = np.zeros(n, dtype=np.float64)
+
+    grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) if len(f.shape) == 3 else f for f in frames]
+
+    for i in range(n):
+        sharp[i] = cv2.Laplacian(grays[i].astype(np.float64), cv2.CV_64F).var()
+
+    for i in range(1, n - 1):
+        gp = grays[i - 1].astype(np.float64)
+        gc = grays[i].astype(np.float64)
+        gn = grays[i + 1].astype(np.float64)
+        motion[i] = (np.mean(np.abs(gc - gp)) + np.mean(np.abs(gc - gn))) / 2.0
+
+    def norm(a: np.ndarray) -> np.ndarray:
+        mn, mx = a.min(), a.max()
+        return np.zeros_like(a) if mx == mn else (a - mn) / (mx - mn)
+
+    score = (1.0 - norm(motion)) * 0.6 + norm(sharp) * 0.4
+    score[0] = -1.0
+    score[-1] = -1.0
+
+    return int(np.argmax(score))
+
+
 def extract_one_frame(
     video_path: Path,
     out_path: Path,
     fmt: str = "jpg",
     quality: int = 95,
-    num_candidates: int = 8
+    num_candidates: int = 12,
+    tags: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
-    Extracts the highest sharpness frame from a video and saves to disk with EXIF preservation.
+    Extracts the highest quality calm frame from a video and saves to disk
+    with complete EXIF metadata, GPS, Adobe XMP packets, and synchronized timestamps.
     """
     import cv2
+    import numpy as np
+    from immich_static.exif import probe_video, save_image_with_metadata
 
-    meta = get_video_metadata(video_path)
-    duration = meta["duration"] or 1.0
-    timestamps = [duration * (i + 0.5) / num_candidates for i in range(num_candidates)]
+    meta = probe_video(video_path)
+    duration = meta.duration_s if meta.duration_s > 0 else 1.0
 
-    best_frame = None
-    best_score = -1.0
-    best_ts = timestamps[0]
+    margin = max(0.5, duration * 0.05)
+    t_start = margin
+    t_end = max(t_start + 1.0, duration - margin)
+
+    n_samples = max(4, min(20, num_candidates))
+    step = (t_end - t_start) / max(1, n_samples - 1)
+    timestamps = [t_start + i * step for i in range(n_samples)]
+
+    frames = []
+    sampled_ts = []
 
     cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open {video_path}")
-
-    try:
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        for ts in timestamps:
-            cap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000.0)
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps))
+    if cap.isOpened():
+        try:
+            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            for ts in timestamps:
+                cap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000.0)
                 ret, frame = cap.read()
+                if not ret or frame is None:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps))
+                    ret, frame = cap.read()
 
-            if ret and frame is not None:
-                score = calculate_sharpness(frame)
-                if score > best_score:
-                    best_score = score
-                    best_frame = frame
-                    best_ts = ts
-    finally:
-        cap.release()
+                if ret and frame is not None:
+                    frames.append(frame)
+                    sampled_ts.append(ts)
+        finally:
+            cap.release()
 
-    if best_frame is None:
+    # Fallback to ffmpeg CLI pipe if OpenCV could not read sufficient frames
+    if len(frames) < 3:
+        frames = []
+        sampled_ts = []
+        for ts in timestamps:
+            cmd = [
+                "ffmpeg",
+                "-ss", f"{ts:.3f}",
+                "-i", str(video_path),
+                "-vframes", "1",
+                "-f", "image2pipe",
+                "-vcodec", "png",
+                "-"
+            ]
+            res = subprocess.run(cmd, capture_output=True, check=False)
+            if res.returncode == 0 and res.stdout:
+                nparr = np.frombuffer(res.stdout, np.uint8)
+                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                if img is not None:
+                    frames.append(img)
+                    sampled_ts.append(ts)
+
+    if not frames:
         return {"file": video_path.name, "status": "error: no frame extracted", "output": ""}
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    best_idx = pick_best_frame(frames)
+    best_frame = frames[best_idx]
+    best_ts = sampled_ts[best_idx]
+    sharpness_score = calculate_sharpness(best_frame)
 
-    # Use ffmpeg with -map_metadata 0 to export frame with EXIF/metadata preserved
-    saved_with_ffmpeg = False
-    try:
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", f"{best_ts:.3f}",
-            "-i", str(video_path),
-            "-vframes", "1",
-        ]
-        if fmt.lower() == "png":
-            cmd.extend(["-compression_level", "3"])
-        else:
-            ffmpeg_q = max(1, min(31, int(round((100 - quality) * 30 / 99 + 1))))
-            cmd.extend(["-q:v", str(ffmpeg_q)])
+    ok = save_image_with_metadata(
+        frame_bgr=best_frame,
+        output_path=out_path,
+        source_video_path=video_path,
+        meta=meta,
+        fmt=fmt,
+        quality=quality,
+        tags=tags,
+    )
 
-        cmd.extend([
-            "-map_metadata", "0",
-            str(out_path)
-        ])
-        res = subprocess.run(cmd, capture_output=True, check=False)
-        if res.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0:
-            saved_with_ffmpeg = True
-    except Exception:
-        pass
-
-    if not saved_with_ffmpeg:
-        if fmt.lower() == "png":
-            cv2.imwrite(str(out_path), best_frame, [cv2.IMWRITE_PNG_COMPRESSION, 3])
-        else:
-            cv2.imwrite(str(out_path), best_frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
-
-    # Preserve file access/modification timestamps
-    try:
-        stat = video_path.stat()
-        os.utime(out_path, (stat.st_atime, stat.st_mtime))
-    except Exception:
-        pass
+    if not ok:
+        return {"file": video_path.name, "status": "error: failed to save frame with metadata", "output": ""}
 
     return {
         "file": video_path.name,
         "status": "ok",
-        "sharpness": round(best_score, 2),
+        "best_frame_idx": best_idx,
+        "total_evaluated": len(frames),
+        "sharpness": round(sharpness_score, 2),
         "timestamp_s": round(best_ts, 2),
         "output": str(out_path),
     }

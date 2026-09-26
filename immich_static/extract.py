@@ -101,8 +101,9 @@ def run_extract(args: Any):
             for (r, vp, out_path, orig_name) in to_process:
                 if _interrupt_event.is_set():
                     break
+                tags_to_embed = [tag_name, "static-video", "extracted-frame"]
                 futures[executor.submit(
-                    extract_one_frame, vp, out_path, fmt, quality
+                    extract_one_frame, vp, out_path, fmt, quality, 12, tags_to_embed
                 )] = (vp, out_path, orig_name)
 
             with make_bar(len(futures), "Extracting") as pbar:
