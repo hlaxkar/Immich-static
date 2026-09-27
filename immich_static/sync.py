@@ -322,12 +322,16 @@ def restore_checkpoint_decisions(ckpt: Checkpoint, sensitivity: str = "medium") 
         except (ValueError, TypeError):
             continue
 
+        # Legacy scale migration: if motion was stored normalized in [0.0, 1.0], rescale to [0, 255]
+        if global_motion <= 1.0 and active_ratio <= 1.0 and duration > 0:
+            global_motion *= 255.0
+
         conf = compute_confidence(global_motion, active_ratio, heur, thresholds, duration=duration)
         new_dec, conf_str = evaluate_decision(conf, thresholds)
 
         aid = r.get("asset_id")
         fn = r.get("filename")
-        ckpt.update_decision(aid or fn, new_dec)
+        ckpt.update_decision(aid or fn, new_dec, new_confidence=conf_str)
         restored_counts[new_dec] += 1
 
     print("🔄 Restored Checkpoint Classifications from Raw Motion Scores:")

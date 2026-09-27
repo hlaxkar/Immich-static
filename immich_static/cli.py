@@ -103,6 +103,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print ffmpeg stderr for any video that fails frame extraction",
     )
     p_detect.add_argument(
+        "--strict-motion", action="store_true",
+        help="Evaluate motion strictly without aspect-ratio or audio heuristic weighting",
+    )
+    p_detect.add_argument(
         "--prune", action="store_true",
         help="Remove orphaned records from SQLite checkpoint for videos no longer in Immich",
     )
@@ -359,6 +363,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Immich API Key (required)",
     )
     p_serve.add_argument(
+        "--strict-motion", action="store_true",
+        help="Evaluate motion strictly without aspect-ratio or audio heuristic weighting",
+    )
+    p_serve.add_argument(
         "--dry-run", action="store_true",
         help="Process videos and log decisions without modifying Immich tags/albums",
     )
@@ -398,6 +406,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument(
         "--api-key", default=os.environ.get("IMMICH_API_KEY"),
         help="Immich API Key for automatic syncing",
+    )
+    p_watch.add_argument(
+        "--strict-motion", action="store_true",
+        help="Evaluate motion strictly without aspect-ratio or audio heuristic weighting",
     )
     p_watch.set_defaults(func=run_watch)
 

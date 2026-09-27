@@ -5,6 +5,16 @@ immich_static.core — Shared engine for Immich static video detection, frame ex
 import atexit
 import json
 import os
+
+# Suppress low-level FFmpeg / OpenCV C-library decoder warning spam on stderr
+os.environ.setdefault("OPENCV_FFMPEG_LOGLEVEL", "-8")
+os.environ.setdefault("AV_LOG_FORCE_NOCOLOR", "1")
+try:
+    import cv2
+    cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+except Exception:
+    pass
+
 import shutil
 import signal
 import sqlite3
@@ -25,13 +35,13 @@ def get_project_root() -> Path:
     """Returns the resolved project root directory."""
     pkg_dir = Path(__file__).resolve().parent
     candidates = [
-        pkg_dir.parent,
         Path.cwd(),
+        pkg_dir.parent,
     ]
     for c in candidates:
-        if (c / "immich_static").is_dir() or (c / ".git").is_dir():
+        if (c / ".git").is_dir() or ((c / "pyproject.toml").is_file() and (c / "immich_static").is_dir()):
             return c.resolve()
-    return pkg_dir.parent.resolve()
+    return Path.cwd().resolve()
 
 
 def load_dotenv(dotenv_path: Optional[Path] = None):
@@ -435,39 +445,76 @@ def extract_sparse_frames(
 ) -> List[Any]:
     """
     Extracts sparse downscaled frames for rapid motion analysis.
-    Uses 5% edge margin trimming and evenly spaced timestamps matching StaticSorter.
+    Uses exact frame index sampling when available, timestamp sampling as fallback,
+    and sequential extraction if seeks fail.
     """
     import cv2
 
+    video_path = Path(video_path)
     if duration <= 0:
         duration = 1.0
 
     num_samples = count if count is not None else sample_count_for_duration(duration)
 
-    margin = max(0.5, duration * 0.05)
-    t_start = margin
-    t_end = max(t_start + 1.0, duration - margin)
-
-    if num_samples <= 1:
-        timestamps = [(t_start + t_end) / 2.0]
-    else:
-        step = (t_end - t_start) / (num_samples - 1)
-        timestamps = [t_start + i * step for i in range(num_samples)]
-
     frames = []
     cap = cv2.VideoCapture(str(video_path))
     if cap.isOpened():
         try:
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-            for ts in timestamps:
-                cap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000.0)
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    frame_idx = int(ts * fps)
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                    ret, frame = cap.read()
 
-                if ret and frame is not None:
+            # 1. Primary: If total_frames is known and valid, sample by exact frame index
+            if total_frames >= 2:
+                indices = [
+                    max(0, min(total_frames - 1, int(total_frames * (i + 0.5) / num_samples)))
+                    for i in range(num_samples)
+                ]
+                for idx in indices:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                    ret, frame = cap.read()
+                    if ret and frame is not None:
+                        h, w = frame.shape[:2]
+                        if w > 0 and h > 0:
+                            scale = target_width / w
+                            new_h = max(1, int(h * scale))
+                            frame = cv2.resize(frame, (target_width, new_h), interpolation=cv2.INTER_AREA)
+                        frames.append(frame)
+
+            # 2. Secondary: If index seeking yielded insufficient frames, try timestamp seeking
+            if len(frames) < 2:
+                frames = []
+                margin = max(0.04, min(0.5, duration * 0.05))
+                t_start = margin
+                t_end = max(t_start + 0.04, duration - margin)
+                step = (t_end - t_start) / max(1, num_samples - 1)
+                timestamps = [t_start + i * step for i in range(num_samples)]
+
+                for ts in timestamps:
+                    cap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000.0)
+                    ret, frame = cap.read()
+                    if not ret or frame is None:
+                        frame_idx = int(ts * fps)
+                        if total_frames > 0:
+                            frame_idx = min(total_frames - 1, frame_idx)
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                        ret, frame = cap.read()
+
+                    if ret and frame is not None:
+                        h, w = frame.shape[:2]
+                        if w > 0 and h > 0:
+                            scale = target_width / w
+                            new_h = max(1, int(h * scale))
+                            frame = cv2.resize(frame, (target_width, new_h), interpolation=cv2.INTER_AREA)
+                        frames.append(frame)
+
+            # 3. Tertiary: Sequential read from beginning (for variable-framerate or stream-based videos)
+            if len(frames) < 2:
+                frames = []
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                while len(frames) < max(2, num_samples):
+                    ret, frame = cap.read()
+                    if not ret or frame is None:
+                        break
                     h, w = frame.shape[:2]
                     if w > 0 and h > 0:
                         scale = target_width / w
@@ -478,6 +525,7 @@ def extract_sparse_frames(
             cap.release()
 
     if len(frames) < 2:
+        timestamps = [duration * (i + 0.5) / num_samples for i in range(num_samples)]
         frames = _ffmpeg_extract_sparse(video_path, timestamps, target_width)
 
     return frames
@@ -560,6 +608,8 @@ def compute_spatial_zone_ratio(
     total_zones = rows * cols
     max_zone_motion = 0.0
 
+    diff_maps = [cv2.absdiff(grays[i], grays[i + 1]) for i in range(len(grays) - 1)]
+
     for r in range(rows):
         for c in range(cols):
             y1 = r * cell_h
@@ -567,12 +617,7 @@ def compute_spatial_zone_ratio(
             x1 = c * cell_w
             x2 = (c + 1) * cell_w if c < cols - 1 else w
 
-            cell_diffs = []
-            for i in range(len(grays) - 1):
-                crop_prev = grays[i][y1:y2, x1:x2]
-                crop_curr = grays[i + 1][y1:y2, x1:x2]
-                diff = cv2.absdiff(crop_prev, crop_curr)
-                cell_diffs.append(float(np.mean(diff)))
+            cell_diffs = [float(np.mean(dm[y1:y2, x1:x2])) for dm in diff_maps]
 
             if cell_diffs:
                 avg_zone_motion = float(np.mean(cell_diffs))
@@ -629,19 +674,23 @@ def compute_confidence(
     heuristic: float,
     cfg: SensitivityConfig,
     duration: float = 0.0,
+    strict_motion: bool = False,
 ) -> float:
     """
     Combine scores into a single confidence rating (0.0 to 1.0) with freeze-frame penalties.
     """
     import numpy as np
 
-    # 1. Motion score: 0 motion -> 1.0, >= review_thresh -> 0.0
-    if global_motion <= 0.0:
+    # 1. Motion score: <= static_thresh -> 1.0, >= review_thresh -> 0.0
+    static_thresh = cfg.global_motion_static
+    review_thresh = max(static_thresh + 0.1, cfg.global_motion_review)
+
+    if global_motion <= static_thresh:
         motion_conf = 1.0
-    elif global_motion >= cfg.global_motion_review:
+    elif global_motion >= review_thresh:
         motion_conf = 0.0
     else:
-        motion_conf = 1.0 - (global_motion / cfg.global_motion_review)
+        motion_conf = 1.0 - ((global_motion - static_thresh) / (review_thresh - static_thresh))
 
     # 2. Spatial zone score: 0 active zones -> 1.0, >= active_zone_ratio * 1.5 -> 0.0
     zone_thresh = cfg.active_zone_ratio * 1.5
@@ -652,14 +701,18 @@ def compute_confidence(
     else:
         zone_conf = 1.0 - (zone_ratio / zone_thresh)
 
-    # Weighted average: 50% global motion, 30% spatial zones, 20% heuristics
-    conf = (motion_conf * 0.50) + (zone_conf * 0.30) + (heuristic * 0.20)
+    # If strict motion is requested, evaluate purely by visual motion without metadata heuristic bias
+    if strict_motion:
+        conf = (motion_conf * 0.60) + (zone_conf * 0.40)
+    else:
+        # Weighted average: 50% global motion, 30% spatial zones, 20% heuristics
+        conf = (motion_conf * 0.50) + (zone_conf * 0.30) + (heuristic * 0.20)
 
-    # Penalty for very short clips (< 10s) to guard against transient freeze-frames
-    if 0 < duration < 5.0:
-        conf *= 0.70
-    elif 0 < duration < 10.0:
-        conf *= 0.85
+        # Penalty for very short clips (< 10s) to guard against transient freeze-frames
+        if 0 < duration < 5.0:
+            conf *= 0.70
+        elif 0 < duration < 10.0:
+            conf *= 0.85
 
     return float(np.clip(conf, 0.0, 1.0))
 
@@ -679,11 +732,13 @@ def evaluate_decision(conf: float, cfg: SensitivityConfig) -> Tuple[str, str]:
 def detect_video(
     video_path: Path,
     cfg: Any = "medium",
-    debug: bool = False
+    debug: bool = False,
+    strict_motion: bool = False,
 ) -> Dict[str, Any]:
     """
     Full pipeline to probe, sample, and classify a single video item matching StaticSorter.
     """
+    video_path = Path(video_path)
     if isinstance(cfg, str):
         cfg = SENSITIVITY_PRESETS.get(cfg, SENSITIVITY_PRESETS["medium"])
     elif isinstance(cfg, dict) and not isinstance(cfg, SensitivityConfig):
@@ -720,9 +775,18 @@ def detect_video(
         result["height"] = meta.height
         result["fps"] = round(meta.fps, 2)
 
+        if meta.width == 0 and meta.height == 0:
+            result["decision"] = "ignored: audio-only"
+            result["error"] = "No video stream in container (audio-only file)"
+            if debug:
+                print(f"ℹ️  [DEBUG] Audio-only file (no video stream): {video_path.name}")
+            return result
+
         if meta.duration_s <= 0 and meta.width == 0:
             result["decision"] = "error: probe failed"
             result["error"] = "Failed to probe video stream/duration"
+            if debug:
+                print(f"⚠️  [DEBUG] Probe failed for {video_path}")
             return result
 
         frames = extract_sparse_frames(video_path, meta.duration_s)
@@ -731,12 +795,14 @@ def detect_video(
         if len(frames) < 2:
             result["decision"] = "error: failed to extract frames"
             result["error"] = "Insufficient frames extracted"
+            if debug:
+                print(f"⚠️  [DEBUG] Insufficient frames ({len(frames)}) extracted from {video_path} (duration: {meta.duration_s}s)")
             return result
 
         g_motion = compute_global_motion(frames)
         z_ratio, max_z = compute_spatial_zone_ratio(frames)
         heur = compute_heuristics(meta)
-        conf = compute_confidence(g_motion, z_ratio, heur, cfg, duration=meta.duration_s)
+        conf = compute_confidence(g_motion, z_ratio, heur, cfg, duration=meta.duration_s, strict_motion=strict_motion)
         decision, conf_str = evaluate_decision(conf, cfg)
 
         result["global_motion_score"] = f"{g_motion:.2f}"
@@ -795,15 +861,19 @@ def pick_best_frame(frames: List[Any]) -> int:
         gn = grays[i + 1].astype(np.float64)
         motion[i] = (np.mean(np.abs(gc - gp)) + np.mean(np.abs(gc - gn))) / 2.0
 
+    # Normalize strictly across candidates [1, n-2] to avoid baseline skew
+    cand_motion = motion[1:-1]
+    cand_sharp = sharp[1:-1]
+
     def norm(a: np.ndarray) -> np.ndarray:
         mn, mx = a.min(), a.max()
         return np.zeros_like(a) if mx == mn else (a - mn) / (mx - mn)
 
-    score = (1.0 - norm(motion)) * 0.6 + norm(sharp) * 0.4
-    score[0] = -1.0
-    score[-1] = -1.0
+    norm_motion = norm(cand_motion)
+    norm_sharp = norm(cand_sharp)
 
-    return int(np.argmax(score))
+    cand_score = (1.0 - norm_motion) * 0.6 + norm_sharp * 0.4
+    return int(np.argmax(cand_score)) + 1
 
 
 def extract_one_frame(
@@ -823,15 +893,13 @@ def extract_one_frame(
     from immich_static.exif import probe_video, save_image_with_metadata
 
     meta = probe_video(video_path)
+    video_path = Path(video_path)
+    out_path = Path(out_path)
+    if meta.width == 0 and meta.height == 0:
+        return {"file": video_path.name, "status": "error: no video stream found", "output": ""}
+
     duration = meta.duration_s if meta.duration_s > 0 else 1.0
-
-    margin = max(0.5, duration * 0.05)
-    t_start = margin
-    t_end = max(t_start + 1.0, duration - margin)
-
     n_samples = max(4, min(20, num_candidates))
-    step = (t_end - t_start) / max(1, n_samples - 1)
-    timestamps = [t_start + i * step for i in range(n_samples)]
 
     frames = []
     sampled_ts = []
@@ -839,17 +907,43 @@ def extract_one_frame(
     cap = cv2.VideoCapture(str(video_path))
     if cap.isOpened():
         try:
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-            for ts in timestamps:
-                cap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000.0)
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, int(ts * fps))
-                    ret, frame = cap.read()
 
-                if ret and frame is not None:
-                    frames.append(frame)
-                    sampled_ts.append(ts)
+            if total_frames >= 4:
+                indices = [
+                    max(0, min(total_frames - 1, int(total_frames * (i + 0.5) / n_samples)))
+                    for i in range(n_samples)
+                ]
+                for idx in indices:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                    ret, frame = cap.read()
+                    if ret and frame is not None:
+                        frames.append(frame)
+                        sampled_ts.append(round(idx / fps, 3))
+
+            if len(frames) < 3:
+                frames = []
+                sampled_ts = []
+                margin = max(0.04, min(0.5, duration * 0.05))
+                t_start = margin
+                t_end = max(t_start + 0.04, duration - margin)
+                step = (t_end - t_start) / max(1, n_samples - 1)
+                timestamps = [t_start + i * step for i in range(n_samples)]
+
+                for ts in timestamps:
+                    cap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000.0)
+                    ret, frame = cap.read()
+                    if not ret or frame is None:
+                        frame_idx = int(ts * fps)
+                        if total_frames > 0:
+                            frame_idx = min(total_frames - 1, frame_idx)
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                        ret, frame = cap.read()
+
+                    if ret and frame is not None:
+                        frames.append(frame)
+                        sampled_ts.append(ts)
         finally:
             cap.release()
 
@@ -1092,13 +1186,20 @@ class Checkpoint:
                 ))
                 conn.commit()
 
-    def update_decision(self, asset_id_or_filename: str, new_decision: str) -> bool:
-        """Updates the decision for a video in both memory cache and SQLite database."""
+    def update_decision(
+        self,
+        asset_id_or_filename: str,
+        new_decision: str,
+        new_confidence: Optional[str] = None,
+    ) -> bool:
+        """Updates the decision and optional confidence for a video in both memory cache and SQLite database."""
         with self._lock:
             row = self._cache_by_asset_id.get(asset_id_or_filename) or self._cache_by_filename.get(asset_id_or_filename)
             if not row:
                 return False
             row["decision"] = new_decision
+            if new_confidence is not None:
+                row["final_confidence"] = str(new_confidence)
             aid = row.get("asset_id")
             fn = row.get("filename")
             if aid:
@@ -1106,10 +1207,16 @@ class Checkpoint:
             if fn:
                 self._cache_by_filename[fn] = row
             with self._get_conn() as conn:
-                conn.execute(
-                    "UPDATE videos SET decision = ? WHERE asset_id = ? OR filename = ?",
-                    (new_decision, aid or asset_id_or_filename, fn or asset_id_or_filename)
-                )
+                if new_confidence is not None:
+                    conn.execute(
+                        "UPDATE videos SET decision = ?, final_confidence = ? WHERE asset_id = ? OR filename = ?",
+                        (new_decision, str(new_confidence), aid or asset_id_or_filename, fn or asset_id_or_filename)
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE videos SET decision = ? WHERE asset_id = ? OR filename = ?",
+                        (new_decision, aid or asset_id_or_filename, fn or asset_id_or_filename)
+                    )
                 conn.commit()
             return True
 

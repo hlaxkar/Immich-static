@@ -210,6 +210,7 @@ def run_detect(args: Any):
 
     interrupted = False
     debug = getattr(args, "debug", False)
+    strict_motion = getattr(args, "strict_motion", False)
 
     # 5. Multi-Threaded Processing on Local Disk
     if to_detect:
@@ -218,7 +219,7 @@ def run_detect(args: Any):
             for (asset, vp) in to_detect:
                 if _interrupt_event.is_set():
                     break
-                futures[executor.submit(detect_video, vp, thresholds, debug)] = (asset, vp)
+                futures[executor.submit(detect_video, vp, thresholds, debug, strict_motion)] = (asset, vp)
 
             with make_bar(len(futures), "Detecting") as pbar:
                 for future in as_completed(futures):

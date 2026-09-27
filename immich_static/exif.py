@@ -100,6 +100,8 @@ def parse_iso_datetime(dt_str: Optional[str]) -> Tuple[Optional[str], Optional[s
     for fmt in formats:
         try:
             dt = datetime.datetime.strptime(cleaned, fmt)
+            if fmt.endswith("Z"):
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
             exif_str = dt.strftime("%Y:%m:%d %H:%M:%S")
             offset = None
             if dt.tzinfo is not None:
@@ -130,8 +132,14 @@ def deg_to_dms(deg_float: float) -> Tuple[float, float, float]:
     d = int(deg)
     m_float = (deg - d) * 60.0
     m = int(m_float)
-    s = (m_float - m) * 60.0
-    return (float(d), float(m), round(s, 4))
+    s = round((m_float - m) * 60.0, 4)
+    if s >= 60.0:
+        s = 0.0
+        m += 1
+    if m >= 60:
+        m = 0
+        d += 1
+    return (float(d), float(m), s)
 
 
 def probe_video(video_path: Path, timeout: int = 15) -> VideoMetadata:
@@ -140,6 +148,7 @@ def probe_video(video_path: Path, timeout: int = 15) -> VideoMetadata:
     Returns populated VideoMetadata object including format/stream tags,
     creation time, camera make/model, and GPS location.
     """
+    video_path = Path(video_path)
     meta = VideoMetadata()
     if not video_path.exists() or not video_path.is_file():
         return meta
@@ -365,7 +374,7 @@ def build_image_exif(
 
     # UserComment in Exif IFD
     user_comment_text = description or (", ".join(keyword_list) if keyword_list else "ImmichStatic")
-    exif_ifd[Base.UserComment] = b"UNICODE\x00" + str(user_comment_text).encode("utf-8")
+    exif_ifd[Base.UserComment] = b"ASCII\x00\x00\x00" + str(user_comment_text).encode("ascii", "replace")
 
     # GPS Info
     lat = meta.latitude
@@ -511,6 +520,9 @@ def run_exiftool_copy(source_video: Path, dest_image: Path) -> bool:
             "-tagsFromFile",
             str(source_video),
             "-all:all>all:all",
+            "-wm",
+            "c",
+            "-Orientation=1",
             "-overwrite_original",
             str(dest_image),
         ]
@@ -565,6 +577,7 @@ def save_image_with_metadata(
             str(output_path),
             format="PNG",
             exif=exif,
+            xmp=xmp_bytes,
             pnginfo=png_info,
             compress_level=3,
         )

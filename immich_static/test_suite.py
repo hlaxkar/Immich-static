@@ -237,6 +237,56 @@ def run_tests():
         server.server_close()
         print("✅ Webhook Server verified end-to-end!")
 
+        # Test 7: Short Clip Handling (< 1.5s)
+        print("\n--- Test 7: Short Clip Handling (< 1.5s) ---")
+        short_vid = TEST_DIR / "test_short.mp4"
+        cmd_short = [
+            "ffmpeg", "-y",
+            "-f", "lavfi",
+            "-i", "color=c=navy:s=360x640:d=0.8:r=25",
+            "-f", "lavfi",
+            "-i", "anullsrc=r=44100:cl=stereo",
+            "-c:v", "libx264",
+            "-c:a", "aac",
+            "-shortest",
+            "-pix_fmt", "yuv420p",
+            str(short_vid),
+        ]
+        subprocess.run(cmd_short, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        res_short = detect_video(short_vid, thresholds)
+        print(f"Short video (0.8s) detection: decision={res_short['decision']}, sampled={res_short['frames_sampled']}")
+        assert res_short["frames_sampled"] >= 2, "Expected at least 2 sampled frames"
+        assert res_short["decision"] == "static", f"Expected 'static', got {res_short['decision']}"
+
+        out_short_frame = TEST_DIR / "extracted_short.jpg"
+        ext_short_res = extract_one_frame(short_vid, out_short_frame)
+        assert ext_short_res["status"] == "ok", f"Expected ok extraction, got {ext_short_res}"
+        assert out_short_frame.exists() and out_short_frame.stat().st_size > 0
+        print("✅ Short clip detection and frame extraction passed!")
+
+        # Test 8: EXIF GPS & UTC Datetime Parsing
+        print("\n--- Test 8: EXIF GPS & UTC Datetime Parsing ---")
+        from immich_static.exif import deg_to_dms, parse_iso_datetime
+        import datetime
+
+        # Test DMS rollover
+        d, m, s = deg_to_dms(12.99999999)
+        assert s < 60.0, f"Seconds overflowed: {s}"
+        assert d == 13.0 and m == 0.0 and s == 0.0, f"Unexpected rollover: {d}, {m}, {s}"
+
+        # Test UTC Z parsing
+        _, offset, dt_obj = parse_iso_datetime("2024-09-26T14:30:00.000Z")
+        assert dt_obj is not None
+        assert dt_obj.tzinfo == datetime.timezone.utc, "Expected UTC timezone-aware datetime"
+        assert offset == "+00:00", f"Expected +00:00 offset, got {offset}"
+        print("✅ EXIF GPS & UTC Datetime precision passed!")
+
+        # Test 9: Strict Motion Mode
+        print("\n--- Test 9: Strict Motion Mode ---")
+        res_strict = detect_video(static_vid, thresholds, strict_motion=True)
+        assert res_strict["decision"] == "static"
+        print("✅ Strict motion classification passed!")
+
         print("\n========================================")
         print("🎉 ALL TESTS PASSED SUCCESSFULLY!")
         print("========================================")
@@ -250,4 +300,8 @@ def cleanup():
 
 
 def run_test_cmd(args: Any = None):
+    run_tests()
+
+
+if __name__ == "__main__":
     run_tests()

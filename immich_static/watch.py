@@ -37,7 +37,8 @@ def run_cycle(
     ckpt: Checkpoint,
     thresholds: dict,
     workers: int,
-    immich_client: Optional[ImmichClient] = None
+    immich_client: Optional[ImmichClient] = None,
+    strict_motion: bool = False,
 ) -> int:
     """Runs a single incremental scan cycle. Returns count of newly detected files."""
     raw_paths = folder.rglob("*")
@@ -61,7 +62,7 @@ def run_cycle(
 
     processed = 0
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(detect_video, vp, thresholds): vp for vp in new_videos}
+        futures = {executor.submit(detect_video, vp, thresholds, False, strict_motion): vp for vp in new_videos}
         for future in as_completed(futures):
             if _stop_event:
                 break
@@ -127,13 +128,14 @@ def run_watch(args: Any):
             print(f"⚠️  Could not connect to Immich API: {e}. Running in local-only mode.")
             immich_client = None
 
+    strict_motion = getattr(args, "strict_motion", False)
     print(f"👀 Watching Immich library at: {folder}")
     print(f"⏱  Scan interval: {interval} seconds | Workers: {workers} | Sensitivity: {sensitivity}")
     print("Press Ctrl+C to stop.\n")
 
     while not _stop_event:
         try:
-            run_cycle(folder, ckpt, thresholds, workers, immich_client)
+            run_cycle(folder, ckpt, thresholds, workers, immich_client, strict_motion=strict_motion)
         except Exception as e:
             print(f"⚠️  Error in watch cycle: {e}")
 
