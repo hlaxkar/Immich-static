@@ -656,7 +656,27 @@ def upload_extracted_frames(client: ImmichClient, output_dir: Path, dry_run: boo
 
     uploaded_ids = []
     for img_path in images:
-        res = client.upload_asset(img_path, created_at=img_path.stat().st_mtime)
+        img_created_at = None
+        try:
+            from PIL import Image
+            from immich_static.exif import parse_iso_datetime
+            with Image.open(img_path) as im:
+                exif = im.getexif()
+                if exif:
+                    dto = exif.get_ifd(0x8769).get(36867) or exif.get(306)
+                    if dto:
+                        _, _, dt_obj = parse_iso_datetime(str(dto))
+                        if dt_obj and dt_obj.year > 1971:
+                            img_created_at = dt_obj.timestamp()
+        except Exception:
+            pass
+
+        if not img_created_at:
+            mtime = img_path.stat().st_mtime
+            if mtime > 31536000:
+                img_created_at = mtime
+
+        res = client.upload_asset(img_path, created_at=img_created_at)
         if res and "id" in res:
             aid = res["id"]
             status_str = res.get("status", "created")

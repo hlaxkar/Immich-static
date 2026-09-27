@@ -25,7 +25,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # ─────────────────────────────────────────────
 # AUTO-LOAD .ENV FILE IF PRESENT
@@ -883,6 +883,9 @@ def extract_one_frame(
     quality: int = 95,
     num_candidates: int = 12,
     tags: Optional[List[str]] = None,
+    original_file_name: Optional[str] = None,
+    date_hint: Optional[str] = None,
+    metadata_hint: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Extracts the highest quality calm frame from a video and saves to disk
@@ -892,9 +895,14 @@ def extract_one_frame(
     import numpy as np
     from immich_static.exif import probe_video, save_image_with_metadata
 
-    meta = probe_video(video_path)
     video_path = Path(video_path)
     out_path = Path(out_path)
+    meta = probe_video(
+        video_path,
+        original_file_name=original_file_name,
+        date_hint=date_hint,
+        metadata_hint=metadata_hint,
+    )
     if meta.width == 0 and meta.height == 0:
         return {"file": video_path.name, "status": "error: no video stream found", "output": ""}
 
@@ -1113,14 +1121,22 @@ class Checkpoint:
                     processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            try:
-                conn.execute("ALTER TABLE videos ADD COLUMN original_file_name TEXT")
-            except Exception:
-                pass
-            try:
-                conn.execute("ALTER TABLE videos ADD COLUMN heuristic_score TEXT")
-            except Exception:
-                pass
+            extra_cols = [
+                ("original_file_name", "TEXT"),
+                ("heuristic_score", "TEXT"),
+                ("date_time_original", "TEXT"),
+                ("file_created_at", "TEXT"),
+                ("latitude", "REAL"),
+                ("longitude", "REAL"),
+                ("altitude", "REAL"),
+                ("camera_make", "TEXT"),
+                ("camera_model", "TEXT"),
+            ]
+            for col, col_type in extra_cols:
+                try:
+                    conn.execute(f"ALTER TABLE videos ADD COLUMN {col} {col_type}")
+                except Exception:
+                    pass
             conn.execute("CREATE INDEX IF NOT EXISTS idx_videos_filename ON videos(filename)")
             conn.commit()
 
@@ -1165,8 +1181,10 @@ class Checkpoint:
                     INSERT OR REPLACE INTO videos (
                         asset_id, filename, original_file_name, decision, final_confidence,
                         global_motion_score, active_zone_ratio, max_zone_motion, heuristic_score,
-                        duration_s, width, height, fps, frames_sampled, error
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        duration_s, width, height, fps, frames_sampled, error,
+                        date_time_original, file_created_at, latitude, longitude, altitude,
+                        camera_make, camera_model
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     aid,
                     fn,
@@ -1183,6 +1201,13 @@ class Checkpoint:
                     float(data.get("fps") or 0.0),
                     int(data.get("frames_sampled") or 0),
                     data.get("error", ""),
+                    str(data.get("date_time_original") or ""),
+                    str(data.get("file_created_at") or ""),
+                    float(data["latitude"]) if data.get("latitude") is not None else None,
+                    float(data["longitude"]) if data.get("longitude") is not None else None,
+                    float(data["altitude"]) if data.get("altitude") is not None else None,
+                    str(data.get("camera_make") or ""),
+                    str(data.get("camera_model") or ""),
                 ))
                 conn.commit()
 

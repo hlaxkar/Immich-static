@@ -47,7 +47,7 @@ detection_checkpoint.sqlite
 detection_log.csv
 
 # Extracted Media & Test Directories
-extracted_frames/
+extracted_frames*/
 extracted_static_frames/
 extracted_review_frames/
 tmp_test_env/

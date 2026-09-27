@@ -418,10 +418,40 @@ def _process_queued_asset(server: WebhookServer, asset_id: str, asset_data: Dict
         stem = Path(orig_name).stem
         out_frame = out_dir / f"{stem}.jpg"
         try:
-            extract_one_frame(video_path, out_frame, fmt="jpg", quality=95)
+            exif_info = asset.get("exifInfo") or {}
+            date_hint = exif_info.get("dateTimeOriginal") or asset.get("fileCreatedAt")
+            extract_one_frame(
+                video_path,
+                out_frame,
+                fmt="jpg",
+                quality=95,
+                original_file_name=orig_name,
+                date_hint=date_hint,
+                metadata_hint={
+                    "latitude": exif_info.get("latitude"),
+                    "longitude": exif_info.get("longitude"),
+                    "altitude": exif_info.get("altitude"),
+                    "make": exif_info.get("make"),
+                    "model": exif_info.get("model"),
+                },
+            )
             _log(f"📸 [EXTRACT] Extracted frame: {out_frame.name}")
             if not server.dry_run:
-                client.upload_asset(out_frame)
+                img_created_at = None
+                try:
+                    from PIL import Image
+                    from immich_static.exif import parse_iso_datetime
+                    with Image.open(out_frame) as im:
+                        exif = im.getexif()
+                        if exif:
+                            dto = exif.get_ifd(0x8769).get(36867) or exif.get(306)
+                            if dto:
+                                _, _, dt_obj = parse_iso_datetime(str(dto))
+                                if dt_obj and dt_obj.year > 1971:
+                                    img_created_at = dt_obj.timestamp()
+                except Exception:
+                    pass
+                client.upload_asset(out_frame, created_at=img_created_at)
                 _log(f"⬆️  [UPLOAD] Uploaded extracted frame to Immich")
         except Exception as e:
             _log(f"⚠️  [EXTRACT] Frame extraction failed: {e}")

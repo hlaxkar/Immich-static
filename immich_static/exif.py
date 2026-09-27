@@ -79,6 +79,7 @@ def parse_iso_datetime(dt_str: Optional[str]) -> Tuple[Optional[str], Optional[s
     """
     Parses an ISO 8601 or common video creation timestamp into:
       (exif_formatted_str 'YYYY:MM:DD HH:MM:SS', tz_offset_str '+HH:MM', datetime_obj)
+    Rejects any uninitialized / epoch-zero timestamps on or before year 1971.
     """
     if not dt_str or not isinstance(dt_str, str):
         return None, None, None
@@ -86,6 +87,22 @@ def parse_iso_datetime(dt_str: Optional[str]) -> Tuple[Optional[str], Optional[s
     cleaned = dt_str.strip()
     if not cleaned:
         return None, None, None
+
+    # Try fromisoformat first (native in Python 3.11+ with timezone support)
+    try:
+        iso_clean = cleaned.replace("Z", "+00:00")
+        dt = datetime.datetime.fromisoformat(iso_clean)
+        if dt.year <= 1971:
+            return None, None, None
+        exif_str = dt.strftime("%Y:%m:%d %H:%M:%S")
+        offset = None
+        if dt.tzinfo is not None:
+            offset_raw = dt.strftime("%z")
+            if offset_raw and len(offset_raw) == 5:
+                offset = f"{offset_raw[:3]}:{offset_raw[3:]}"
+        return exif_str, offset, dt
+    except Exception:
+        pass
 
     formats = [
         "%Y-%m-%dT%H:%M:%S.%fZ",
@@ -102,6 +119,8 @@ def parse_iso_datetime(dt_str: Optional[str]) -> Tuple[Optional[str], Optional[s
             dt = datetime.datetime.strptime(cleaned, fmt)
             if fmt.endswith("Z"):
                 dt = dt.replace(tzinfo=datetime.timezone.utc)
+            if dt.year <= 1971:
+                return None, None, None
             exif_str = dt.strftime("%Y:%m:%d %H:%M:%S")
             offset = None
             if dt.tzinfo is not None:
@@ -116,6 +135,8 @@ def parse_iso_datetime(dt_str: Optional[str]) -> Tuple[Optional[str], Optional[s
     match = re.match(r"(\d{4})[-:.](\d{2})[-:.](\d{2})[T ](\d{2}):(\d{2}):(\d{2})", cleaned)
     if match:
         y, m, d, hh, mm, ss = match.groups()
+        if int(y) <= 1971:
+            return None, None, None
         exif_str = f"{y}:{m}:{d} {hh}:{mm}:{ss}"
         try:
             dt_obj = datetime.datetime(int(y), int(m), int(d), int(hh), int(mm), int(ss))
@@ -124,6 +145,172 @@ def parse_iso_datetime(dt_str: Optional[str]) -> Tuple[Optional[str], Optional[s
         return exif_str, None, dt_obj
 
     return None, None, None
+
+
+def parse_filename_datetime(filename: str) -> Optional[datetime.datetime]:
+    """
+    Infers creation datetime from filename heuristics:
+    1. Instagram Story Snowflake IDs (story_<snowflake_id>):
+       Decodes timestamp in ms: (snowflake_id >> 23) + 1314220021721.
+    2. Date-time formats like YYYYMMDD_HHMMSS or YYYY-MM-DD-HHMMSS.
+    3. Date formats like YYYY-MM-DD or YYYYMMDD.
+    4. 10-digit UNIX epoch timestamps.
+    """
+    if not filename:
+        return None
+    name = Path(filename).stem
+
+    # 1. Instagram Story Snowflake ID: story_<id>
+    m_story = re.search(r"story_(\d{18,20})", name)
+    if not m_story:
+        m_story = re.search(r"(?:^|_)(\d{18,20})(?:_|$)", name)
+    if m_story:
+        try:
+            snowflake_id = int(m_story.group(1))
+            ts_ms = (snowflake_id >> 23) + 1314220021721
+            dt = datetime.datetime.fromtimestamp(ts_ms / 1000.0, tz=datetime.timezone.utc)
+            if 2011 <= dt.year <= 2035:
+                return dt
+        except Exception:
+            pass
+
+    # 2. YYYYMMDD_HHMMSS or YYYYMMDD-HHMMSS (e.g. 20260925_234636531, 20260519_182208)
+    m_dt = re.search(r"(\d{4})(\d{2})(\d{2})[_\-T ](\d{2})(\d{2})(\d{2})", name)
+    if m_dt:
+        try:
+            y, m, d, hh, mm, ss = map(int, m_dt.groups())
+            if 1980 <= y <= 2035 and 1 <= m <= 12 and 1 <= d <= 31 and 0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59:
+                return datetime.datetime(y, m, d, hh, mm, ss, tzinfo=datetime.timezone.utc)
+        except Exception:
+            pass
+
+    # 3. YYYY-MM-DD-HHMM or YYYYMMDD-HHMM (e.g. 20230908-0001)
+    m_date = re.search(r"(\d{4})[-_.]?(\d{2})[-_.]?(\d{2})[-_](\d{4})", name)
+    if m_date:
+        try:
+            y, m, d = int(m_date.group(1)), int(m_date.group(2)), int(m_date.group(3))
+            num = int(m_date.group(4))
+            hh = min(23, num // 100)
+            mm = min(59, num % 100)
+            if 1980 <= y <= 2035 and 1 <= m <= 12 and 1 <= d <= 31:
+                return datetime.datetime(y, m, d, hh, mm, 0, tzinfo=datetime.timezone.utc)
+        except Exception:
+            pass
+
+    # 4. YYYY-MM-DD or YYYY_MM_DD
+    m_donly = re.search(r"(\d{4})[-_](\d{2})[-_](\d{2})", name)
+    if m_donly:
+        try:
+            y, m, d = map(int, m_donly.groups())
+            if 1980 <= y <= 2035 and 1 <= m <= 12 and 1 <= d <= 31:
+                return datetime.datetime(y, m, d, 12, 0, 0, tzinfo=datetime.timezone.utc)
+        except Exception:
+            pass
+
+    # 5. Unix timestamp in seconds (10 digits starting with 14-17)
+    m_ts = re.search(r"(?:^|_)(\b1[4-7]\d{8}\b)(?:_|$)", name)
+    if m_ts:
+        try:
+            ts = int(m_ts.group(1))
+            dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+            if 2014 <= dt.year <= 2035:
+                return dt
+        except Exception:
+            pass
+
+    return None
+
+
+def parse_sidecar_metadata(video_path: Path) -> Dict[str, Any]:
+    """
+    Parses XMP or JSON (Google Takeout) sidecar files located next to video_path.
+    Looks for video.ext.xmp, video.xmp, video.ext.json, video.json.
+    """
+    video_p = Path(video_path)
+    candidates = [
+        video_p.with_suffix(video_p.suffix + ".xmp"),
+        video_p.with_suffix(".xmp"),
+        video_p.with_suffix(video_p.suffix + ".json"),
+        video_p.with_suffix(".json"),
+    ]
+
+    result: Dict[str, Any] = {}
+
+    for cand in candidates:
+        if not cand.exists() or not cand.is_file():
+            continue
+
+        ext = cand.suffix.lower()
+        if ext == ".xmp":
+            try:
+                content = cand.read_text(encoding="utf-8", errors="ignore")
+                # DateTimeOriginal / DateCreated / CreateDate / ModifyDate
+                m_dt = (
+                    re.search(r"<(?:exif:DateTimeOriginal|photoshop:DateCreated|xmp:CreateDate)>([^<]+)</", content)
+                    or re.search(r"(?:exif:DateTimeOriginal|photoshop:DateCreated|xmp:CreateDate)=\"([^\"]+)\"", content)
+                    or re.search(r"<(?:xmp:ModifyDate|dc:date)>([^<]+)</", content)
+                )
+                if m_dt and "creation_time" not in result:
+                    raw_dt = m_dt.group(1).strip()
+                    _, _, dt_obj = parse_iso_datetime(raw_dt)
+                    if dt_obj and dt_obj.year > 1971:
+                        result["creation_time"] = raw_dt
+
+                # Camera Make & Model
+                m_make = re.search(r"<tiff:Make>([^<]+)</", content) or re.search(r"tiff:Make=\"([^\"]+)\"", content)
+                if m_make and "make" not in result:
+                    result["make"] = m_make.group(1).strip()
+
+                m_model = re.search(r"<tiff:Model>([^<]+)</", content) or re.search(r"tiff:Model=\"([^\"]+)\"", content)
+                if m_model and "model" not in result:
+                    result["model"] = m_model.group(1).strip()
+
+                # GPS Coordinates
+                m_lat = re.search(r"<(?:exif:GPSLatitude)>([^<]+)</", content)
+                m_lon = re.search(r"<(?:exif:GPSLongitude)>([^<]+)</", content)
+                m_alt = re.search(r"<(?:exif:GPSAltitude)>([^<]+)</", content)
+                if m_lat and m_lon and "latitude" not in result:
+                    try:
+                        result["latitude"] = float(m_lat.group(1).strip())
+                        result["longitude"] = float(m_lon.group(1).strip())
+                        result["altitude"] = float(m_alt.group(1).strip()) if m_alt else None
+                    except ValueError:
+                        pass
+
+                # Tags / Keywords from digiKam:TagsList or dc:subject
+                tags = []
+                for m_tag in re.finditer(r"<rdf:li>([^<]+)</rdf:li>", content):
+                    t = m_tag.group(1).strip()
+                    if t and t not in tags:
+                        tags.append(t)
+                if tags:
+                    result.setdefault("tags", []).extend(tags)
+            except Exception:
+                pass
+
+        elif ext == ".json":
+            try:
+                import json
+                data = json.loads(cand.read_text(encoding="utf-8", errors="ignore"))
+                taken = (
+                    data.get("photoTakenTime", {}).get("timestamp")
+                    or data.get("creationTime", {}).get("timestamp")
+                )
+                if taken and "creation_time" not in result:
+                    ts = int(taken)
+                    dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+                    if dt.year > 1971:
+                        result["creation_time"] = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+                geo = data.get("geoData", {})
+                if (geo.get("latitude") or geo.get("longitude")) and "latitude" not in result:
+                    result["latitude"] = float(geo.get("latitude", 0.0))
+                    result["longitude"] = float(geo.get("longitude", 0.0))
+                    result["altitude"] = float(geo.get("altitude", 0.0))
+            except Exception:
+                pass
+
+    return result
 
 
 def deg_to_dms(deg_float: float) -> Tuple[float, float, float]:
@@ -142,11 +329,19 @@ def deg_to_dms(deg_float: float) -> Tuple[float, float, float]:
     return (float(d), float(m), s)
 
 
-def probe_video(video_path: Path, timeout: int = 15) -> VideoMetadata:
+def probe_video(
+    video_path: Path,
+    original_file_name: Optional[str] = None,
+    date_hint: Optional[str] = None,
+    metadata_hint: Optional[Dict[str, Any]] = None,
+    timeout: int = 15,
+) -> VideoMetadata:
     """
-    Probe video metadata using ffprobe.
+    Probe video metadata using ffprobe and sidecars (.xmp / .json).
     Returns populated VideoMetadata object including format/stream tags,
     creation time, camera make/model, and GPS location.
+    Guarantees epoch-zero (<= 1971) dummy dates are discarded and replaced
+    by sidecar, Immich date_hint, or filename heuristics.
     """
     video_path = Path(video_path)
     meta = VideoMetadata()
@@ -232,12 +427,18 @@ def probe_video(video_path: Path, timeout: int = 15) -> VideoMetadata:
 
         meta.tags = all_tags
 
-        # Creation time
-        meta.creation_time = (
+        # ffprobe creation time (validate > 1971)
+        raw_creation = (
             all_tags.get("creation_time")
             or all_tags.get("com.apple.quicktime.creationdate")
             or all_tags.get("date")
         )
+        if raw_creation:
+            _, _, parsed_dt = parse_iso_datetime(raw_creation)
+            if parsed_dt and parsed_dt.year > 1971:
+                meta.creation_time = raw_creation
+            else:
+                meta.creation_time = None
 
         # Make & model
         meta.make = (
@@ -268,6 +469,65 @@ def probe_video(video_path: Path, timeout: int = 15) -> VideoMetadata:
 
     except Exception:
         pass
+
+    # ── Sidecar Metadata Enrichment (.xmp / .json) ───────────────
+    sidecar = parse_sidecar_metadata(video_path)
+    if sidecar.get("creation_time") and not meta.creation_time:
+        meta.creation_time = sidecar["creation_time"]
+    if sidecar.get("make") and not meta.make:
+        meta.make = sidecar["make"]
+    if sidecar.get("model") and not meta.model:
+        meta.model = sidecar["model"]
+    if sidecar.get("latitude") is not None and meta.latitude is None:
+        meta.latitude = sidecar["latitude"]
+        meta.longitude = sidecar["longitude"]
+        meta.altitude = sidecar.get("altitude")
+    if sidecar.get("tags"):
+        existing_kw = meta.tags.get("keywords", "")
+        kw_list = [k.strip() for k in existing_kw.split(",") if k.strip()] if existing_kw else []
+        for t in sidecar["tags"]:
+            if t not in kw_list:
+                kw_list.append(t)
+        meta.tags["keywords"] = ", ".join(kw_list)
+
+    # ── Date Hint Fallback (Immich API / SQLite Checkpoint) ───────
+    if not meta.creation_time and date_hint:
+        _, _, hint_dt = parse_iso_datetime(str(date_hint))
+        if hint_dt and hint_dt.year > 1971:
+            meta.creation_time = str(date_hint)
+
+    # ── Filename Heuristics Fallback (Instagram Story, ISO dates) ─
+    if not meta.creation_time:
+        fn_candidate = original_file_name or video_path.name
+        fn_dt = parse_filename_datetime(fn_candidate)
+        if fn_dt and fn_dt.year > 1971:
+            meta.creation_time = fn_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # ── Filesystem mtime Fallback ────────────────────────────────
+    if not meta.creation_time:
+        try:
+            mtime = video_path.stat().st_mtime
+            if mtime > 31536000:  # > 1971-01-01
+                m_dt = datetime.datetime.fromtimestamp(mtime, tz=datetime.timezone.utc)
+                if m_dt.year > 1971:
+                    meta.creation_time = m_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            pass
+
+    # ── Metadata Hint (GPS, Make, Model) ─────────────────────────
+    if metadata_hint:
+        if meta.latitude is None and metadata_hint.get("latitude") is not None:
+            try:
+                meta.latitude = float(metadata_hint["latitude"])
+                meta.longitude = float(metadata_hint.get("longitude", 0.0))
+                if metadata_hint.get("altitude") is not None:
+                    meta.altitude = float(metadata_hint["altitude"])
+            except (ValueError, TypeError):
+                pass
+        if not meta.make and metadata_hint.get("make"):
+            meta.make = str(metadata_hint["make"])
+        if not meta.model and metadata_hint.get("model"):
+            meta.model = str(metadata_hint["model"])
 
     return meta
 
@@ -455,7 +715,7 @@ def build_png_info(
 
 
 def build_xmp_packet(meta: VideoMetadata, tags: Optional[List[str]] = None) -> bytes:
-    """Constructs an Adobe XMP packet with Dublin Core subject and description for Immich / Lightroom."""
+    """Constructs an Adobe XMP packet with Dublin Core, Exif, and Photoshop metadata for Immich / Lightroom."""
     keyword_list: List[str] = list(tags if tags is not None else DEFAULT_IMAGE_TAGS)
     meta_tags = meta.tags or {}
     if "keywords" in meta_tags:
@@ -479,6 +739,33 @@ def build_xmp_packet(meta: VideoMetadata, tags: Optional[List[str]] = None) -> b
             .replace("'", "&apos;")
         )
 
+    # Date block for XMP
+    date_block = ""
+    creation_raw = (
+        meta.creation_time
+        or meta_tags.get("creation_time")
+        or meta_tags.get("com.apple.quicktime.creationdate")
+        or meta_tags.get("date")
+    )
+    _, tz_off, dt_obj = parse_iso_datetime(creation_raw)
+    if dt_obj is not None and dt_obj.year > 1971:
+        if dt_obj.tzinfo is not None:
+            iso_dt = dt_obj.isoformat()
+        elif tz_off:
+            iso_dt = f"{dt_obj.strftime('%Y-%m-%dT%H:%M:%S')}{tz_off}"
+        else:
+            iso_dt = dt_obj.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        date_block = f"""
+  <rdf:Description rdf:about=""
+    xmlns:exif="http://ns.adobe.com/exif/1.0/"
+    xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/"
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+   <exif:DateTimeOriginal>{_escape(iso_dt)}</exif:DateTimeOriginal>
+   <photoshop:DateCreated>{_escape(iso_dt)}</photoshop:DateCreated>
+   <xmp:CreateDate>{_escape(iso_dt)}</xmp:CreateDate>
+  </rdf:Description>"""
+
     bag_items = "".join(f"<rdf:li>{_escape(t)}</rdf:li>" for t in keyword_list)
     xmp_str = f"""<x:xmpmeta xmlns:x="adobe:ns:meta/">
  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
@@ -500,7 +787,7 @@ def build_xmp_packet(meta: VideoMetadata, tags: Optional[List[str]] = None) -> b
      {bag_items}
     </rdf:Bag>
    </lr:hierarchicalSubject>
-  </rdf:Description>
+  </rdf:Description>{date_block}
  </rdf:RDF>
 </x:xmpmeta>"""
     return xmp_str.encode("utf-8")
@@ -544,9 +831,9 @@ def save_image_with_metadata(
     """
     Saves extracted OpenCV frame (BGR numpy array) to output_path with:
     1. EXIF metadata (Make, Model, DateTimeOriginal, GPSInfo, Orientation, Software, XPKeywords, ImageDescription)
-    2. Adobe XMP packet (dc:subject, dc:description, lr:hierarchicalSubject) for Immich / Lightroom
+    2. Adobe XMP packet (dc:subject, dc:description, lr:hierarchicalSubject, exif:DateTimeOriginal) for Immich / Lightroom
     3. PNG textual metadata chunks if output format is PNG
-    4. Filesystem timestamps (os.utime) synced to source video
+    4. Filesystem timestamps (os.utime) synced to source video or inferred creation datetime
     5. Optional exiftool supplementary copy if installed
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -603,11 +890,14 @@ def save_image_with_metadata(
             or (meta.tags or {}).get("com.apple.quicktime.creationdate")
         )
         _, _, dt_obj = parse_iso_datetime(creation_raw)
-        if dt_obj is not None:
+        if dt_obj is not None and dt_obj.year > 1971:
             ts = dt_obj.timestamp()
             os.utime(output_path, (src_stat.st_atime, ts))
-        else:
+        elif src_stat.st_mtime > 31536000:
             os.utime(output_path, (src_stat.st_atime, src_stat.st_mtime))
+        else:
+            now_ts = time.time()
+            os.utime(output_path, (now_ts, now_ts))
     except Exception:
         pass
 

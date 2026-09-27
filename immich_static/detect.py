@@ -183,13 +183,35 @@ def run_detect(args: Any):
         api_url=api_url,
     )
 
-    # Backfill originalFileName for existing entries if needed
+    # Backfill originalFileName and EXIF metadata for existing entries if needed
     for (asset, vp) in valid_targets:
         aid = asset["id"]
         cached = ckpt._cache_by_asset_id.get(aid)
-        if cached and not cached.get("original_file_name"):
-            cached["original_file_name"] = asset.get("originalFileName") or vp.name
-            ckpt.record(aid, cached)
+        if cached:
+            updated = False
+            if not cached.get("original_file_name"):
+                cached["original_file_name"] = asset.get("originalFileName") or vp.name
+                updated = True
+            exif_data = asset.get("exifInfo") or {}
+            if not cached.get("date_time_original") and exif_data.get("dateTimeOriginal"):
+                cached["date_time_original"] = exif_data.get("dateTimeOriginal")
+                updated = True
+            if not cached.get("file_created_at") and asset.get("fileCreatedAt"):
+                cached["file_created_at"] = asset.get("fileCreatedAt")
+                updated = True
+            if cached.get("latitude") is None and exif_data.get("latitude") is not None:
+                cached["latitude"] = exif_data.get("latitude")
+                cached["longitude"] = exif_data.get("longitude")
+                cached["altitude"] = exif_data.get("altitude")
+                updated = True
+            if not cached.get("camera_make") and exif_data.get("make"):
+                cached["camera_make"] = exif_data.get("make")
+                updated = True
+            if not cached.get("camera_model") and exif_data.get("model"):
+                cached["camera_model"] = exif_data.get("model")
+                updated = True
+            if updated:
+                ckpt.record(aid, cached)
 
     # 4. Filter Assets Needing Detection
     to_detect = [
@@ -237,6 +259,14 @@ def run_detect(args: Any):
                     row["asset_id"] = aid
                     row["filename"] = str(vp.resolve())
                     row["original_file_name"] = asset.get("originalFileName") or vp.name
+                    exif_data = asset.get("exifInfo") or {}
+                    row["date_time_original"] = exif_data.get("dateTimeOriginal") or ""
+                    row["file_created_at"] = asset.get("fileCreatedAt") or ""
+                    row["latitude"] = exif_data.get("latitude")
+                    row["longitude"] = exif_data.get("longitude")
+                    row["altitude"] = exif_data.get("altitude")
+                    row["camera_make"] = exif_data.get("make") or ""
+                    row["camera_model"] = exif_data.get("model") or ""
                     ckpt.record(aid, row)
                     pbar.update(1)
                     pbar.set_postfix({

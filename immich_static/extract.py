@@ -71,8 +71,24 @@ def run_extract(args: Any):
     skip_existing = getattr(args, "skip_existing", True)
     fresh = getattr(args, "fresh", False)
 
+    def _needs_extraction(t) -> bool:
+        r, vp, out_p, orig_name = t
+        if not out_p.exists():
+            return True
+        # If output file exists, re-extract if it has a missing or epoch-zero (1970) EXIF date
+        try:
+            from PIL import Image
+            with Image.open(out_p) as im:
+                exif = im.getexif()
+                dto = exif.get_ifd(0x8769).get(36867) or exif.get(306)
+                if not dto or str(dto).startswith("1970") or str(dto).startswith("1904"):
+                    return True
+        except Exception:
+            return True
+        return False
+
     if skip_existing and not fresh:
-        to_process = [t for t in targets if not t[2].exists()]
+        to_process = [t for t in targets if _needs_extraction(t)]
         skipped_count = len(targets) - len(to_process)
     else:
         to_process = targets
@@ -102,8 +118,25 @@ def run_extract(args: Any):
                 if _interrupt_event.is_set():
                     break
                 tags_to_embed = [tag_name, "static-video", "extracted-frame"]
+                date_hint = r.get("date_time_original") or r.get("file_created_at")
+                metadata_hint = {
+                    "latitude": r.get("latitude"),
+                    "longitude": r.get("longitude"),
+                    "altitude": r.get("altitude"),
+                    "make": r.get("camera_make"),
+                    "model": r.get("camera_model"),
+                }
                 futures[executor.submit(
-                    extract_one_frame, vp, out_path, fmt, quality, 12, tags_to_embed
+                    extract_one_frame,
+                    video_path=vp,
+                    out_path=out_path,
+                    fmt=fmt,
+                    quality=quality,
+                    num_candidates=12,
+                    tags=tags_to_embed,
+                    original_file_name=orig_name,
+                    date_hint=date_hint,
+                    metadata_hint=metadata_hint,
                 )] = (vp, out_path, orig_name)
 
             with make_bar(len(futures), "Extracting") as pbar:
