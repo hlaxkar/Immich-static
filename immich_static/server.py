@@ -165,7 +165,7 @@ class WebhookServer(ThreadingHTTPServer):
         extract_frame: bool = False,
         extract_dir: Optional[Path] = None,
         dry_run: bool = False,
-        strict_motion: bool = False,
+        **kwargs: Any,
     ):
         super().__init__(server_address, handler_class)
         self.client = client
@@ -179,7 +179,6 @@ class WebhookServer(ThreadingHTTPServer):
         self.extract_frame = extract_frame
         self.extract_dir = extract_dir
         self.dry_run = dry_run
-        self.strict_motion = strict_motion
         self.worker_queue: queue.Queue = queue.Queue()
 
 
@@ -379,7 +378,7 @@ def _process_queued_asset(server: WebhookServer, asset_id: str, asset_data: Dict
     _log(f"🎬 [DETECT] Analyzing motion for '{orig_name}' (ID: {asset_id})...")
 
     try:
-        row = detect_video(video_path, thresholds, strict_motion=server.strict_motion)
+        row = detect_video(video_path, thresholds)
     except Exception as e:
         row = {f: "" for f in LOG_FIELDS}
         row["decision"] = f"error: {e}"
@@ -521,8 +520,6 @@ def run_serve(args: Any):
         print(f"❌ Could not connect to Immich API: {e}")
         sys.exit(1)
 
-    strict_motion = getattr(args, "strict_motion", False)
-
     try:
         server = WebhookServer(
             (host, port),
@@ -538,7 +535,6 @@ def run_serve(args: Any):
             extract_frame=extract_frame,
             extract_dir=extract_dir,
             dry_run=dry_run,
-            strict_motion=strict_motion,
         )
     except OSError as e:
         if e.errno == 98 or "already in use" in str(e).lower():

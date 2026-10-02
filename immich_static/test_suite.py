@@ -281,11 +281,11 @@ def run_tests():
         assert offset == "+00:00", f"Expected +00:00 offset, got {offset}"
         print("✅ EXIF GPS & UTC Datetime precision passed!")
 
-        # Test 9: Strict Motion Mode
-        print("\n--- Test 9: Strict Motion Mode ---")
-        res_strict = detect_video(static_vid, thresholds, strict_motion=True)
-        assert res_strict["decision"] == "static"
-        print("✅ Strict motion classification passed!")
+        # Test 9: Pure Visual Motion Verification
+        print("\n--- Test 9: Pure Visual Motion Verification ---")
+        res_pure = detect_video(static_vid, thresholds)
+        assert res_pure["decision"] == "static"
+        print("✅ Visual motion classification passed!")
 
         print("\n========================================")
         print("🎉 ALL TESTS PASSED SUCCESSFULLY!")

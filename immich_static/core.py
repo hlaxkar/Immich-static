@@ -3,6 +3,7 @@ immich_static.core — Shared engine for Immich static video detection, frame ex
 """
 
 import atexit
+from contextlib import contextmanager
 import json
 import os
 
@@ -630,56 +631,27 @@ def compute_spatial_zone_ratio(
     return round(active_ratio, 3), round(max_zone_motion, 4)
 
 
-def compute_heuristics(meta: Any) -> float:
-    """
-    Layer 3: Score likelihood of being a static repost/visualizer from metadata signals.
-    """
-    import numpy as np
-
-    score = 0.5  # Neutral baseline
-
-    aspect_ratio = getattr(meta, "aspect_ratio", None) or (meta.get("aspect_ratio") if isinstance(meta, dict) else "unknown")
-    has_audio = getattr(meta, "has_audio", False) if hasattr(meta, "has_audio") else (meta.get("has_audio", False) if isinstance(meta, dict) else False)
-    duration_s = getattr(meta, "duration_s", 0.0) if hasattr(meta, "duration_s") else (meta.get("duration", 0.0) if isinstance(meta, dict) else 0.0)
-    codec = (getattr(meta, "codec", "") or (meta.get("codec", "") if isinstance(meta, dict) else "")).lower()
-
-    # Aspect ratio signals (Instagram Reels / TikTok / Square reposts)
-    if aspect_ratio in ("9:16", "1:1", "4:5"):
-        score += 0.20
-    elif aspect_ratio == "16:9":
-        score -= 0.10
-
-    # Audio presence (often static music visualizers or reposts have audio)
-    if has_audio:
-        score += 0.15
-    else:
-        score -= 0.15
-
-    # Duration signals
-    if 5.0 <= duration_s <= 600.0:
-        score += 0.10
-    elif duration_s > 1800.0:  # > 30 mins
-        score -= 0.20
-
-    # Codec signals
-    if codec in ("h264", "hevc", "av1", "vp9"):
-        score += 0.05
-
-    return float(np.clip(score, 0.0, 1.0))
+def compute_heuristics(meta: Any = None) -> float:
+    """Deprecated: Metadata heuristic guesswork has been removed in favor of direct visual motion analysis."""
+    return 0.5
 
 
 def compute_confidence(
     global_motion: float,
     zone_ratio: float,
-    heuristic: float,
-    cfg: SensitivityConfig,
+    heuristic: Optional[float] = None,
+    cfg: Optional[SensitivityConfig] = None,
     duration: float = 0.0,
-    strict_motion: bool = False,
+    **kwargs: Any,
 ) -> float:
     """
-    Combine scores into a single confidence rating (0.0 to 1.0) with freeze-frame penalties.
+    Combine scores into a single confidence rating (0.0 to 1.0) based purely on visual ground truth:
+    60% Global Motion + 40% Spatial Active Zones (36-zone 6x6 grid analysis).
     """
     import numpy as np
+
+    if cfg is None:
+        cfg = SENSITIVITY_PRESETS["medium"]
 
     # 1. Motion score: <= static_thresh -> 1.0, >= review_thresh -> 0.0
     static_thresh = cfg.global_motion_static
@@ -701,18 +673,14 @@ def compute_confidence(
     else:
         zone_conf = 1.0 - (zone_ratio / zone_thresh)
 
-    # If strict motion is requested, evaluate purely by visual motion without metadata heuristic bias
-    if strict_motion:
-        conf = (motion_conf * 0.60) + (zone_conf * 0.40)
-    else:
-        # Weighted average: 50% global motion, 30% spatial zones, 20% heuristics
-        conf = (motion_conf * 0.50) + (zone_conf * 0.30) + (heuristic * 0.20)
+    # Pure visual motion: 60% global motion, 40% spatial zone distribution
+    conf = (motion_conf * 0.60) + (zone_conf * 0.40)
 
-        # Penalty for very short clips (< 10s) to guard against transient freeze-frames
-        if 0 < duration < 5.0:
-            conf *= 0.70
-        elif 0 < duration < 10.0:
-            conf *= 0.85
+    # Penalty for very short clips (< 10s) to guard against transient freeze-frames
+    if 0 < duration < 5.0:
+        conf *= 0.70
+    elif 0 < duration < 10.0:
+        conf *= 0.85
 
     return float(np.clip(conf, 0.0, 1.0))
 
@@ -733,7 +701,7 @@ def detect_video(
     video_path: Path,
     cfg: Any = "medium",
     debug: bool = False,
-    strict_motion: bool = False,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """
     Full pipeline to probe, sample, and classify a single video item matching StaticSorter.
@@ -801,14 +769,13 @@ def detect_video(
 
         g_motion = compute_global_motion(frames)
         z_ratio, max_z = compute_spatial_zone_ratio(frames)
-        heur = compute_heuristics(meta)
-        conf = compute_confidence(g_motion, z_ratio, heur, cfg, duration=meta.duration_s, strict_motion=strict_motion)
+        conf = compute_confidence(g_motion, z_ratio, cfg=cfg, duration=meta.duration_s)
         decision, conf_str = evaluate_decision(conf, cfg)
 
         result["global_motion_score"] = f"{g_motion:.2f}"
         result["active_zone_ratio"] = f"{z_ratio:.2f}"
         result["max_zone_motion"] = f"{max_z:.2f}"
-        result["heuristic_score"] = f"{heur:.2f}"
+        result["heuristic_score"] = "0.00"
         result["final_confidence"] = conf_str
         result["decision"] = decision
 
@@ -1080,21 +1047,28 @@ class Checkpoint:
     """
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path).resolve()
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._cache_by_filename: Dict[str, Dict[str, Any]] = {}
         self._cache_by_asset_id: Dict[str, Dict[str, Any]] = {}
         self._init_db()
         self._load_cache()
 
-    def _get_conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=30.0)
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA synchronous = NORMAL")
+    @contextmanager
+    def _get_conn(self):
+        conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=60.0)
+        conn.execute("PRAGMA busy_timeout = 60000")
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     def _init_db(self):
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._get_conn() as conn:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS meta (
                     key TEXT PRIMARY KEY,
@@ -1169,10 +1143,39 @@ class Checkpoint:
             return False
         return str(row.get("decision", "")).startswith("error")
 
-    def record(self, asset_id_or_filename: str, data: Dict[str, Any]):
+    def _build_video_row_tuple(self, asset_id_or_filename: str, data: Dict[str, Any]) -> Tuple:
         aid = data.get("asset_id") or asset_id_or_filename
         fn = data.get("filename") or asset_id_or_filename
         orig_name = data.get("original_file_name") or Path(fn).name
+        return (
+            aid,
+            fn,
+            orig_name,
+            data.get("decision", ""),
+            str(data.get("final_confidence", "")),
+            str(data.get("global_motion_score", "")),
+            str(data.get("active_zone_ratio", "")),
+            str(data.get("max_zone_motion", "")),
+            str(data.get("heuristic_score", "")),
+            str(data.get("duration_s", "")),
+            int(data.get("width") or 0),
+            int(data.get("height") or 0),
+            float(data.get("fps") or 0.0),
+            int(data.get("frames_sampled") or 0),
+            data.get("error", ""),
+            str(data.get("date_time_original") or ""),
+            str(data.get("file_created_at") or ""),
+            float(data["latitude"]) if data.get("latitude") is not None else None,
+            float(data["longitude"]) if data.get("longitude") is not None else None,
+            float(data["altitude"]) if data.get("altitude") is not None else None,
+            str(data.get("camera_make") or ""),
+            str(data.get("camera_model") or ""),
+        )
+
+    def record(self, asset_id_or_filename: str, data: Dict[str, Any]):
+        aid = data.get("asset_id") or asset_id_or_filename
+        fn = data.get("filename") or asset_id_or_filename
+        params = self._build_video_row_tuple(asset_id_or_filename, data)
         with self._lock:
             self._cache_by_asset_id[aid] = data
             self._cache_by_filename[fn] = data
@@ -1185,30 +1188,31 @@ class Checkpoint:
                         date_time_original, file_created_at, latitude, longitude, altitude,
                         camera_make, camera_model
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    aid,
-                    fn,
-                    orig_name,
-                    data.get("decision", ""),
-                    str(data.get("final_confidence", "")),
-                    str(data.get("global_motion_score", "")),
-                    str(data.get("active_zone_ratio", "")),
-                    str(data.get("max_zone_motion", "")),
-                    str(data.get("heuristic_score", "")),
-                    str(data.get("duration_s", "")),
-                    int(data.get("width") or 0),
-                    int(data.get("height") or 0),
-                    float(data.get("fps") or 0.0),
-                    int(data.get("frames_sampled") or 0),
-                    data.get("error", ""),
-                    str(data.get("date_time_original") or ""),
-                    str(data.get("file_created_at") or ""),
-                    float(data["latitude"]) if data.get("latitude") is not None else None,
-                    float(data["longitude"]) if data.get("longitude") is not None else None,
-                    float(data["altitude"]) if data.get("altitude") is not None else None,
-                    str(data.get("camera_make") or ""),
-                    str(data.get("camera_model") or ""),
-                ))
+                """, params)
+                conn.commit()
+
+    def record_batch(self, items: List[Tuple[str, Dict[str, Any]]]):
+        if not items:
+            return
+        row_params = []
+        with self._lock:
+            for key, data in items:
+                aid = data.get("asset_id") or key
+                fn = data.get("filename") or key
+                self._cache_by_asset_id[aid] = data
+                self._cache_by_filename[fn] = data
+                row_params.append(self._build_video_row_tuple(key, data))
+
+            with self._get_conn() as conn:
+                conn.executemany("""
+                    INSERT OR REPLACE INTO videos (
+                        asset_id, filename, original_file_name, decision, final_confidence,
+                        global_motion_score, active_zone_ratio, max_zone_motion, heuristic_score,
+                        duration_s, width, height, fps, frames_sampled, error,
+                        date_time_original, file_created_at, latitude, longitude, altitude,
+                        camera_make, camera_model
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, row_params)
                 conn.commit()
 
     def update_decision(

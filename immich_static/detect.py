@@ -50,15 +50,14 @@ def print_report(rows: List[Dict[str, Any]]):
         group.sort(key=lambda r: float(r.get("final_confidence") or 0), reverse=True)
         label = {"static": "🖼  STATIC", "review": "🔍 REVIEW", "dynamic": "🎥 DYNAMIC"}[d]
         print(f"\n{label} ({len(group)})")
-        print(f"  {'filename':<45} {'conf':>6}  {'motion':>7}  {'zones':>6}  {'heur':>6}  {'dur':>6}")
-        print(f"  {'─'*45} {'─'*6}  {'─'*7}  {'─'*6}  {'─'*6}  {'─'*6}")
+        print(f"  {'filename':<50} {'conf':>6}  {'motion':>7}  {'zones':>6}  {'dur':>6}")
+        print(f"  {'─'*50} {'─'*6}  {'─'*7}  {'─'*6}  {'─'*6}")
         for r in group[:30]:
             print(
-                f"  {r.get('filename','')[-45:]:<45} "
+                f"  {r.get('filename','')[-50:]:<50} "
                 f"{r.get('final_confidence','?'):>6}  "
                 f"{r.get('global_motion_score','?'):>7}  "
                 f"{r.get('active_zone_ratio','?'):>6}  "
-                f"{r.get('heuristic_score','?'):>6}  "
                 f"{r.get('duration_s','?'):>6}s"
             )
         if len(group) > 30:
@@ -184,6 +183,7 @@ def run_detect(args: Any):
     )
 
     # Backfill originalFileName and EXIF metadata for existing entries if needed
+    to_update_batch = []
     for (asset, vp) in valid_targets:
         aid = asset["id"]
         cached = ckpt._cache_by_asset_id.get(aid)
@@ -211,7 +211,10 @@ def run_detect(args: Any):
                 cached["camera_model"] = exif_data.get("model")
                 updated = True
             if updated:
-                ckpt.record(aid, cached)
+                to_update_batch.append((aid, cached))
+
+    if to_update_batch:
+        ckpt.record_batch(to_update_batch)
 
     # 4. Filter Assets Needing Detection
     to_detect = [
@@ -232,7 +235,6 @@ def run_detect(args: Any):
 
     interrupted = False
     debug = getattr(args, "debug", False)
-    strict_motion = getattr(args, "strict_motion", False)
 
     # 5. Multi-Threaded Processing on Local Disk
     if to_detect:
@@ -241,7 +243,7 @@ def run_detect(args: Any):
             for (asset, vp) in to_detect:
                 if _interrupt_event.is_set():
                     break
-                futures[executor.submit(detect_video, vp, thresholds, debug, strict_motion)] = (asset, vp)
+                futures[executor.submit(detect_video, vp, thresholds, debug)] = (asset, vp)
 
             with make_bar(len(futures), "Detecting") as pbar:
                 for future in as_completed(futures):

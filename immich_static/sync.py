@@ -317,7 +317,6 @@ def restore_checkpoint_decisions(ckpt: Checkpoint, sensitivity: str = "medium") 
         try:
             global_motion = float(g_str)
             active_ratio = float(z_str)
-            heur = float(r.get("heuristic_score") or 0.5)
             duration = float(r.get("duration_s") or 0.0)
         except (ValueError, TypeError):
             continue
@@ -326,7 +325,7 @@ def restore_checkpoint_decisions(ckpt: Checkpoint, sensitivity: str = "medium") 
         if global_motion <= 1.0 and active_ratio <= 1.0 and duration > 0:
             global_motion *= 255.0
 
-        conf = compute_confidence(global_motion, active_ratio, heur, thresholds, duration=duration)
+        conf = compute_confidence(global_motion, active_ratio, cfg=thresholds, duration=duration)
         new_dec, conf_str = evaluate_decision(conf, thresholds)
 
         aid = r.get("asset_id")
