@@ -20,7 +20,7 @@ from PIL import Image
 from PIL.ExifTags import Base, IFD, GPS
 from PIL.PngImagePlugin import PngInfo
 
-DEFAULT_IMAGE_TAGS = ["static-video", "extracted-frame"]
+DEFAULT_IMAGE_TAGS = [os.environ.get("TAG_EXTRACTED", "video:extracted")]
 
 
 @dataclass

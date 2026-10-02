@@ -117,7 +117,7 @@ def run_extract(args: Any):
             for (r, vp, out_path, orig_name) in to_process:
                 if _interrupt_event.is_set():
                     break
-                tags_to_embed = [tag_name, "static-video", "extracted-frame"]
+                tags_to_embed = [tag_name]
                 date_hint = r.get("date_time_original") or r.get("file_created_at")
                 metadata_hint = {
                     "latitude": r.get("latitude"),
