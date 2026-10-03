@@ -7,58 +7,102 @@ An API-first, zero-download toolkit and CLI for Immich. It scans video libraries
 ## ⚡ Key Features
 
 1. **Zero-Download Speed (Local Mount Data Plane)**:
-   - Analyzes video frames directly on your mounted Immich storage volume (`/path/to/immich/library`) using multi-core OpenCV / FFmpeg.
+   - Analyzes video frames directly on your mounted Immich storage volume (`/path/to/immich/library`) using multi-core OpenCV / FFmpeg without round-tripping video files over HTTP.
 2. **Multi-Frame Motion & Zone Analysis**:
-   - Analyzes global motion and $4\times4$ localized grid zones to classify videos into `static`, `review`, and `dynamic`.
+   - Analyzes global motion and $4\times4$ localized grid zones to accurately classify videos into `static`, `review`, and `dynamic`.
 3. **Unified CLI Architecture**:
-   - Single command `immich-static` with subcommands (`detect`, `sync`, `stats`, `pull`, `extract`, `watch`, `test`).
+   - Single command `immich-static` with subcommands: `detect`, `sync`, `stats`, `pull`, `restore`, `extract`, `serve`, `service`, `watch`, and `test`.
 4. **Resumable SQLite Checkpoint**:
    - Thread-safe WAL SQLite database (`detection_checkpoint.sqlite`) allowing instant pause, interrupt (Ctrl+C), and resume.
 5. **Bidirectional Immich Sync**:
    - Automatically populates `video:static`, `video:review`, and `video:dynamic` tags and albums in Immich.
    - Allows manual UI review in Immich and pulls changes back with `immich-static pull`.
 6. **Sharpness-Aware Still Extractor**:
-   - Uses Laplacian variance ($Var(\nabla^2 f)$) across sampled frames to select and extract the single sharpest photo with EXIF metadata preserved.
-7. **Continuous Background Watcher**:
-   - Background daemon (`immich-static watch`) for incremental scanning of new video uploads.
+   - Uses Laplacian variance ($Var(\nabla^2 f)$) across sampled frames to select and extract the single sharpest photo with EXIF, GPS, and creation timestamps preserved.
+7. **Real-Time Webhook Daemon**:
+   - Event-driven HTTP webhook listener (`immich-static serve`) triggered by Immich Workflows on video upload.
+8. **Native Background Service (systemd)**:
+   - Built-in installer (`immich-static service install`) configuring user-level systemd daemons with linger enabled (no root/sudo needed).
+9. **Continuous Background Watcher**:
+   - Background polling daemon (`immich-static watch`) for incremental scanning of new video uploads.
 
 ---
 
 ## 🛠 Installation & Prerequisites
 
+### Prerequisites:
 - Python 3.9+
-- `ffmpeg` & `ffprobe` installed on system (`sudo apt install ffmpeg`)
+- `ffmpeg` & `ffprobe` installed on system:
+  ```bash
+  sudo apt install ffmpeg
+  ```
+- *(Optional, Recommended)* `exiftool` for lossless EXIF & camera maker-notes passthrough:
+  ```bash
+  sudo apt install libimage-exiftool-perl
+  ```
 
 ### Install via pip:
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/immich-static.git
-cd immich-static
+git clone https://github.com/hlaxkar/Immich-static.git
+cd Immich-static
 
 # Install locally in editable/development mode:
 pip install -e .
 
-# Or standard install:
-pip install .
+# Or install dependencies via requirements.txt:
+pip install -r requirements.txt
 ```
 
 ---
 
 ## ⚙️ Configuration (`.env`)
 
-Create a `.env` file in your workspace or set system environment variables:
+Create a `.env` file in your project directory or pass settings via environment variables (see [`.env.example`](.env.example) for a complete template):
 
 ```bash
-IMMICH_API_URL=https://immich.yourdomain.com/api
+# ==============================================================================
+# Immich Server Connection
+# ==============================================================================
+IMMICH_API_URL=http://localhost:2283
 IMMICH_API_KEY=your_immich_api_key_here
-IMMICH_LIBRARY_PATH=/mnt/storage/immich/library
 
-# Optional defaults:
-SENSITIVITY=medium          # low | medium | high
-WORKERS=16                  # Parallel detection workers
+# Paths & Storage
+# ------------------------------------------------------------------------------
+# Path to your mounted Immich library directory (read-only recommended)
+IMMICH_LIBRARY_PATH=/path/to/immich/library
+
+# Path to the SQLite checkpoint database
+DB_PATH=./detection_checkpoint.sqlite
+
+# Directory to save extracted still frames
 EXTRACT_OUTPUT_DIR=./extracted_frames
-EXTRACT_FORMAT=jpg          # jpg | png
-EXTRACT_QUALITY=95          # 1-100
+
+# Tags & Namespaces
+# ------------------------------------------------------------------------------
+TAG_STATIC=video:static
+TAG_REVIEW=video:review
+TAG_DYNAMIC=video:dynamic
+TAG_EXTRACTED=video:extracted
+
+# Detection & Extraction Settings
+# ------------------------------------------------------------------------------
+SENSITIVITY=medium          # low | medium | high (default: medium)
+WORKERS=16                  # Parallel worker threads (default: CPU core count)
+EXTRACT_FORMAT=jpg          # jpg | png (default: jpg)
+EXTRACT_QUALITY=95          # 1-100 (default: 95)
+
+# Daemon & Automation Settings
+# ------------------------------------------------------------------------------
+WATCH_INTERVAL=300          # Seconds between polling cycles (default: 300)
+WEBHOOK_HOST=0.0.0.0        # Webhook server bind address
+WEBHOOK_PORT=8080           # Webhook server port
+WEBHOOK_SECRET=             # Shared secret token for header X-Webhook-Secret
+
+# Docker Container <-> Host Path Remapping (Optional)
+# If Immich originalPath is inside a container, map it to your local filesystem:
+# IMMICH_REMOTE_PATH_PREFIX=/usr/src/app/upload
+# IMMICH_LOCAL_PATH_PREFIX=/mnt/storage/immich
 ```
 
 ---
@@ -73,7 +117,7 @@ immich-static detect
 # Useful flags:
 immich-static detect --sensitivity high
 immich-static detect --workers 8
-immich-static detect --report                 # Print motion score details
+immich-static detect --report                 # Print motion score confidence details
 immich-static detect --export-csv results.csv # Export detection table to CSV
 immich-static detect --sync                   # Auto-sync to Immich after scan
 immich-static detect --dry-run                # Preview tag/album changes
@@ -103,9 +147,9 @@ immich-static sync --upload-extracted
 ---
 
 ### 4. Review in Immich & Pull Corrections Back to Database
-1. Open **`[Static] Videos`** album in your Immich web / mobile app.
+1. Open the **`[Static] Videos`** album in your Immich web / mobile app.
 2. Select any false positives and remove them or move them to **`[Dynamic] Videos`**.
-3. Pull your changes back into the local SQLite database:
+3. Pull your changes back into the local SQLite checkpoint:
 
 ```bash
 # Preview changes:
@@ -117,7 +161,20 @@ immich-static pull
 
 ---
 
-### 5. Extract Sharpest Frames & Upload
+### 5. Recalculate Classifications (Instant Sensitivity Tuning)
+Re-evaluates video classifications stored in SQLite across different sensitivity presets without re-reading or re-decoding video files:
+
+```bash
+# Recalculate with a different sensitivity threshold:
+immich-static restore --sensitivity high
+
+# Alias command:
+immich-static recalculate --sensitivity low
+```
+
+---
+
+### 6. Extract Sharpest Frames & Upload
 ```bash
 # 1. Extract frames locally (preserves original video timestamps):
 immich-static extract
@@ -131,7 +188,7 @@ immich-static extract --target-decision review --format png
 
 ---
 
-### 6. Real-Time Webhook Daemon (Recommended for Immich v3+)
+### 7. Real-Time Webhook Daemon (Recommended for Immich v3+)
 Instead of periodic disk polling, run `immich-static` as an event-driven webhook listener triggered instantly when videos are uploaded:
 
 ```bash
@@ -161,13 +218,13 @@ immich-static serve \
 5. Save and activate the workflow. New video uploads will be classified and tagged instantly!
 
 #### Running in Background via systemd (Auto-Start on Boot)
-You can install and run the webhook server as a background service with a single command without writing configuration files manually:
+Install and manage the webhook server as a background service with a single command without writing unit files manually:
 
 ```bash
 # Auto-detects Python environment, .env file, and installs as auto-starting systemd service:
 immich-static service install --port 8080 --secret my_secure_token
 
-# Preview what it will configure without installing:
+# Preview generated unit file without installing:
 immich-static service install --dry-run
 
 # Manage the service:
@@ -181,7 +238,7 @@ immich-static service uninstall # Remove service unit
 
 ---
 
-### 7. Continuous Polling Watcher (Legacy Fallback)
+### 8. Continuous Polling Watcher (Legacy Fallback)
 For offline environments or older Immich versions (< v3.0.0) without Workflows:
 ```bash
 immich-static watch --interval 300
@@ -189,7 +246,7 @@ immich-static watch --interval 300
 
 ---
 
-### 8. Run Verification Test Suite
+### 9. Run Verification Test Suite
 ```bash
 immich-static test
 ```
@@ -199,22 +256,26 @@ immich-static test
 ## 📦 Package Structure
 
 ```
-immich-static/
+Immich-static/
 ├── pyproject.toml              # Modern build configuration (PEP 517/621)
 ├── setup.py                    # Backward compatibility for pip install -e .
 ├── requirements.txt            # Python dependencies
+├── .env.example                # Configuration template
 ├── immich_static/              # Main Python package
 │   ├── __init__.py             # Package version & top-level exports
 │   ├── __main__.py             # Entrypoint for `python -m immich_static`
 │   ├── cli.py                  # Main CLI argument parser and subcommand router
-│   ├── core.py                 # Motion analysis, Laplacian sharpness, Checkpoint DB
 │   ├── client.py               # Robust Immich REST API client
+│   ├── core.py                 # Motion analysis, Laplacian sharpness, Checkpoint DB
 │   ├── detect.py               # Multithreaded library scanner & classifier
-│   ├── sync.py                 # Tags/albums sync, pull, stats, and upload logic
-│   ├── server.py               # Real-time webhook server & async worker queue
+│   ├── exif.py                 # EXIF, GPS, UTC timestamp preservation & XMP parsing
 │   ├── extract.py              # Sharpness-aware still frame extractor
-│   ├── watch.py                # Periodic polling background watcher
-│   └── test_suite.py           # Synthetic verification tests
+│   ├── server.py               # Real-time webhook server & async worker queue
+│   ├── service.py              # Background systemd service installation & manager
+│   ├── sync.py                 # Tags/albums sync, pull, stats, and upload logic
+│   ├── test_suite.py           # Synthetic verification tests
+│   └── watch.py                # Periodic polling background watcher
+├── core.py                     # Backward-compatibility root shim
 ├── detect.py                   # Backward-compatibility root shim
 ├── immich_sync.py              # Backward-compatibility root shim
 ├── extract.py                  # Backward-compatibility root shim

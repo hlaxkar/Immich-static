@@ -9,6 +9,7 @@ setup(
         "opencv-python-headless>=4.5.0",
         "numpy>=1.20.0",
         "tqdm>=4.60.0",
+        "pillow>=9.0.0",
     ],
     entry_points={
         "console_scripts": [

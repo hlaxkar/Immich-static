@@ -24,6 +24,11 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Virtual Environments
 venv/
@@ -51,6 +56,9 @@ extracted_frames*/
 extracted_static_frames/
 extracted_review_frames/
 tmp_test_env/
+
+# Local Utilities / Uncommitted Tools
+check_trash_size.py
 
 # IDE & OS
 .DS_Store
