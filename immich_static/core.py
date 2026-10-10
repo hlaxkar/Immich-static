@@ -1105,6 +1105,10 @@ class Checkpoint:
                 ("altitude", "REAL"),
                 ("camera_make", "TEXT"),
                 ("camera_model", "TEXT"),
+                ("synced_tag", "TEXT"),
+                ("synced_album", "TEXT"),
+                ("synced_at", "TEXT"),
+                ("user_curated", "INTEGER DEFAULT 0"),
             ]
             for col, col_type in extra_cols:
                 try:
@@ -1170,6 +1174,9 @@ class Checkpoint:
             float(data["altitude"]) if data.get("altitude") is not None else None,
             str(data.get("camera_make") or ""),
             str(data.get("camera_model") or ""),
+            str(data.get("synced_tag")) if data.get("synced_tag") is not None else None,
+            str(data.get("synced_at")) if data.get("synced_at") is not None else None,
+            int(data.get("user_curated") or 0),
         )
 
     def record(self, asset_id_or_filename: str, data: Dict[str, Any]):
@@ -1186,8 +1193,8 @@ class Checkpoint:
                         global_motion_score, active_zone_ratio, max_zone_motion, heuristic_score,
                         duration_s, width, height, fps, frames_sampled, error,
                         date_time_original, file_created_at, latitude, longitude, altitude,
-                        camera_make, camera_model
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        camera_make, camera_model, synced_tag, synced_at, user_curated
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, params)
                 conn.commit()
 
@@ -1210,8 +1217,8 @@ class Checkpoint:
                         global_motion_score, active_zone_ratio, max_zone_motion, heuristic_score,
                         duration_s, width, height, fps, frames_sampled, error,
                         date_time_original, file_created_at, latitude, longitude, altitude,
-                        camera_make, camera_model
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        camera_make, camera_model, synced_tag, synced_at, user_curated
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, row_params)
                 conn.commit()
 
@@ -1220,6 +1227,7 @@ class Checkpoint:
         asset_id_or_filename: str,
         new_decision: str,
         new_confidence: Optional[str] = None,
+        user_curated: Optional[int] = None,
     ) -> bool:
         """Updates the decision and optional confidence for a video in both memory cache and SQLite database."""
         with self._lock:
@@ -1229,6 +1237,8 @@ class Checkpoint:
             row["decision"] = new_decision
             if new_confidence is not None:
                 row["final_confidence"] = str(new_confidence)
+            if user_curated is not None:
+                row["user_curated"] = user_curated
             aid = row.get("asset_id")
             fn = row.get("filename")
             if aid:
@@ -1236,10 +1246,20 @@ class Checkpoint:
             if fn:
                 self._cache_by_filename[fn] = row
             with self._get_conn() as conn:
-                if new_confidence is not None:
+                if new_confidence is not None and user_curated is not None:
+                    conn.execute(
+                        "UPDATE videos SET decision = ?, final_confidence = ?, user_curated = ? WHERE asset_id = ? OR filename = ?",
+                        (new_decision, str(new_confidence), user_curated, aid or asset_id_or_filename, fn or asset_id_or_filename)
+                    )
+                elif new_confidence is not None:
                     conn.execute(
                         "UPDATE videos SET decision = ?, final_confidence = ? WHERE asset_id = ? OR filename = ?",
                         (new_decision, str(new_confidence), aid or asset_id_or_filename, fn or asset_id_or_filename)
+                    )
+                elif user_curated is not None:
+                    conn.execute(
+                        "UPDATE videos SET decision = ?, user_curated = ? WHERE asset_id = ? OR filename = ?",
+                        (new_decision, user_curated, aid or asset_id_or_filename, fn or asset_id_or_filename)
                     )
                 else:
                     conn.execute(
@@ -1248,6 +1268,111 @@ class Checkpoint:
                     )
                 conn.commit()
             return True
+
+    def update_decisions_batch(
+        self,
+        items: List[Tuple[str, str, Optional[str]]],
+        user_curated: Optional[int] = None,
+    ):
+        """Batch updates decisions and optional confidences in a single fast transaction."""
+        if not items:
+            return
+        params_by_aid = []
+        params_by_fn = []
+        with self._lock:
+            for key, new_decision, new_confidence in items:
+                row = self._cache_by_asset_id.get(key) or self._cache_by_filename.get(key)
+                if row:
+                    row["decision"] = new_decision
+                    if new_confidence is not None:
+                        row["final_confidence"] = str(new_confidence)
+                    if user_curated is not None:
+                        row["user_curated"] = user_curated
+                    aid = row.get("asset_id")
+                    fn = row.get("filename")
+                    if aid:
+                        self._cache_by_asset_id[aid] = row
+                    if fn:
+                        self._cache_by_filename[fn] = row
+
+                # Choose primary key if known for instant O(1) indexed update
+                aid = (row.get("asset_id") if row else None) or (key if key in self._cache_by_asset_id else None)
+                conf_val = str(new_confidence) if new_confidence is not None else (row.get("final_confidence", "") if row else "")
+                if aid:
+                    if user_curated is not None:
+                        params_by_aid.append((new_decision, conf_val, user_curated, aid))
+                    else:
+                        params_by_aid.append((new_decision, conf_val, aid))
+                else:
+                    if user_curated is not None:
+                        params_by_fn.append((new_decision, conf_val, user_curated, key))
+                    else:
+                        params_by_fn.append((new_decision, conf_val, key))
+
+            with self._get_conn() as conn:
+                if user_curated is not None:
+                    if params_by_aid:
+                        conn.executemany("UPDATE videos SET decision = ?, final_confidence = ?, user_curated = ? WHERE asset_id = ?", params_by_aid)
+                    if params_by_fn:
+                        conn.executemany("UPDATE videos SET decision = ?, final_confidence = ?, user_curated = ? WHERE filename = ?", params_by_fn)
+                else:
+                    if params_by_aid:
+                        conn.executemany("UPDATE videos SET decision = ?, final_confidence = ? WHERE asset_id = ?", params_by_aid)
+                    if params_by_fn:
+                        conn.executemany("UPDATE videos SET decision = ?, final_confidence = ? WHERE filename = ?", params_by_fn)
+                conn.commit()
+
+    def update_sync_status(
+        self,
+        asset_id_or_filename: str,
+        synced_album: Optional[str],
+        synced_at: Optional[str] = None,
+    ) -> bool:
+        """Updates the synced_album and synced_at for an asset in cache and database."""
+        actual_time = synced_at or datetime.now().isoformat()
+        with self._lock:
+            row = self._cache_by_asset_id.get(asset_id_or_filename) or self._cache_by_filename.get(asset_id_or_filename)
+            aid = row.get("asset_id") if row else (asset_id_or_filename if asset_id_or_filename in self._cache_by_asset_id else None)
+            if row:
+                row["synced_album"] = synced_album
+                row["synced_at"] = actual_time
+            with self._get_conn() as conn:
+                if aid:
+                    conn.execute("UPDATE videos SET synced_album = ?, synced_at = ? WHERE asset_id = ?", (synced_album, actual_time, aid))
+                else:
+                    conn.execute("UPDATE videos SET synced_album = ?, synced_at = ? WHERE filename = ?", (synced_album, actual_time, asset_id_or_filename))
+                conn.commit()
+            return True
+
+    def update_sync_status_batch(
+        self,
+        items: List[Tuple[str, Optional[str], Optional[str]]],
+    ):
+        """Batch updates synced_album and synced_at in a single fast transaction."""
+        if not items:
+            return
+        now_str = datetime.now().isoformat()
+        params_by_aid = []
+        params_by_fn = []
+        with self._lock:
+            for key, album, s_at in items:
+                actual_time = s_at or now_str
+                row = self._cache_by_asset_id.get(key) or self._cache_by_filename.get(key)
+                if row:
+                    row["synced_album"] = album
+                    row["synced_at"] = actual_time
+                aid = (row.get("asset_id") if row else None) or (key if key in self._cache_by_asset_id else None)
+                if aid:
+                    params_by_aid.append((album, actual_time, aid))
+                else:
+                    params_by_fn.append((album, actual_time, key))
+
+            with self._get_conn() as conn:
+                if params_by_aid:
+                    conn.executemany("UPDATE videos SET synced_album = ?, synced_at = ? WHERE asset_id = ?", params_by_aid)
+                if params_by_fn:
+                    conn.executemany("UPDATE videos SET synced_album = ?, synced_at = ? WHERE filename = ?", params_by_fn)
+                conn.commit()
 
     def save_meta(self, **kwargs):
         with self._get_conn() as conn:

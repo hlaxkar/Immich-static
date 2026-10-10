@@ -326,26 +326,24 @@ def run_detect(args: Any):
     sync = getattr(args, "sync", False)
 
     if dry_run and not interrupted:
-        print("\n🏷  [DRY-RUN] Previewing sync to Immich Tags & Albums...")
+        print("\n📁 [DRY-RUN] Previewing sync to Immich Albums...")
         try:
             sync_immich(
                 client=client,
                 ckpt=ckpt,
                 dry_run=True,
-                sync_tags=True,
                 sync_albums=True,
                 include_dynamic=True,
             )
         except Exception as e:
             print(f"⚠️  Immich dry-run preview failed: {e}")
     elif sync and not interrupted:
-        print("\n🏷  Syncing classifications to Immich Tags & Albums...")
+        print("\n📁 Syncing classifications to Immich Albums...")
         try:
             sync_immich(
                 client=client,
                 ckpt=ckpt,
                 dry_run=False,
-                sync_tags=True,
                 sync_albums=True,
                 include_dynamic=True,
             )
@@ -355,6 +353,6 @@ def run_detect(args: Any):
     elif not interrupted:
         print("\n💡 No changes were made to Immich (detection results saved locally).")
         print("   • To preview changes safely:  immich-static sync --dry-run")
-        print("   • To apply Tags and Albums:   immich-static sync")
+        print("   • To apply Albums:            immich-static sync")
 
     print()

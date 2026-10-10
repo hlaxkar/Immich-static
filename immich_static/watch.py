@@ -80,7 +80,7 @@ def run_cycle(
             print(f"   [{row.get('decision', '?').upper()}] {vp.name} (motion: {row.get('global_motion_score', '?')})")
 
     if immich_client and processed > 0 and not _stop_event:
-        print("🔄 Syncing new classifications to Immich tags and albums...")
+        print("🔄 Syncing new classifications to Immich albums...")
         try:
             sync_immich(immich_client, ckpt, dry_run=False)
         except Exception as e:

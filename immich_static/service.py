@@ -41,7 +41,7 @@ def generate_unit_content(
 ) -> str:
     args_str = " ".join(serve_args) if serve_args else ""
     exec_start = f"{python_exec} -m immich_static.cli serve {args_str}".strip()
-    env_line = f"EnvironmentFile={env_file.resolve()}" if env_file and env_file.is_file() else ""
+    env_line = f"EnvironmentFile=-{env_file.resolve()}" if env_file and env_file.is_file() else ""
     target = "default.target" if is_user_mode else "multi-user.target"
     user_line = "" if is_user_mode else f"User={user}\n"
 
@@ -82,10 +82,10 @@ def install_service(
     unit_file, cmd_prefix = get_service_paths(is_user_mode)
 
     python_exec = sys.executable
-    working_dir = Path.cwd()
-    env_file = working_dir / ".env"
+    working_dir = Path.cwd().resolve()
+    env_file = (working_dir / ".env").resolve()
     if not env_file.exists():
-        repo_root = Path(__file__).resolve().parent.parent
+        repo_root = Path(__file__).resolve().parent.parent.resolve()
         if (repo_root / ".env").exists():
             working_dir = repo_root
             env_file = repo_root / ".env"

@@ -113,8 +113,8 @@ def build_parser() -> argparse.ArgumentParser:
     # ─────────────────────────────────────────────
     p_sync = subparsers.add_parser(
         "sync",
-        help="Sync classified videos from SQLite checkpoint to Immich Tags & Albums.",
-        description="Applies tags (video:static, video:review, video:dynamic) and organizes videos into albums.",
+        help="Sync classified videos from SQLite checkpoint to Immich Albums.",
+        description="Organizes classified videos into [Static] Videos, [Review] Videos, and [Dynamic] Videos albums.",
     )
     p_sync.add_argument(
         "--api-url", default=os.environ.get("IMMICH_API_URL"),
@@ -130,16 +130,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to SQLite checkpoint database (default: ./detection_checkpoint.sqlite)",
     )
     p_sync.add_argument(
-        "--no-tags", action="store_true",
-        help="Skip applying tags to assets",
-    )
-    p_sync.add_argument(
-        "--no-albums", action="store_true",
-        help="Skip adding assets to albums",
+        "--cleanup-tags", action="store_true",
+        help="Remove legacy classification tags (video:static, video:review, video:dynamic) from Immich",
     )
     p_sync.add_argument(
         "--include-dynamic", action=argparse.BooleanOptionalAction, default=True,
-        help="Also tag and create album for dynamic videos (default: True)",
+        help="Also create album for dynamic videos (default: True)",
     )
     p_sync.add_argument(
         "--upload-extracted", action="store_true",
@@ -200,10 +196,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--db", "--db-path", dest="db_path",
         default=os.environ.get("DB_PATH", "./" + CHECKPOINT_FILENAME),
         help="Path to SQLite checkpoint database",
-    )
-    p_pull.add_argument(
-        "--no-tag-sync-on-pull", action="store_true",
-        help="Skip updating Immich tags when pulling album changes",
     )
     p_pull.add_argument(
         "--dry-run", action="store_true",

@@ -224,13 +224,12 @@ def run_tests():
         # Wait for queue to drain
         server.worker_queue.join()
 
-        # Verify asset was classified as static and tagged/album added
+        # Verify asset was classified as static and added to album
         assert ckpt.is_done(test_asset_id) is True
         row = ckpt.get(test_asset_id)
         assert row["decision"] == "static"
-        assert test_asset_id in mock_client.tagged
         assert test_asset_id in mock_client.album_added
-        print(f"   • Asset processed: {test_asset_id} -> STATIC, tagged and added to album!")
+        print(f"   • Asset processed: {test_asset_id} -> STATIC, added to album!")
 
         # Shutdown test server
         server.shutdown()
@@ -286,6 +285,114 @@ def run_tests():
         res_pure = detect_video(static_vid, thresholds)
         assert res_pure["decision"] == "static"
         print("✅ Visual motion classification passed!")
+
+        # Test 10: Tag-Authoritative Pull & Conflict Resolution
+        # Test 10: Album-Authoritative Pull & Conflict Resolution (User Albums Safe)
+        print("\n--- Test 10: Album-Authoritative Pull & Conflict Resolution (User Albums Safe) ---")
+        from immich_static.sync import pull_immich_to_checkpoint
+
+        class MockAlbumImmichClient:
+            def __init__(self):
+                self.albums = [
+                    {"id": "a-static", "albumName": "[Static] Videos"},
+                    {"id": "a-review", "albumName": "[Review] Videos"},
+                    {"id": "a-dynamic", "albumName": "[Dynamic] Videos"},
+                    {"id": "a-pets", "albumName": "Pets"},
+                ]
+                self.album_to_assets = {
+                    "a-static": {"aid-static", "aid-conflict"},
+                    "a-review": set(),
+                    "a-dynamic": {"aid-dynamic", "aid-conflict"},
+                    "a-pets": {"aid-static", "aid-conflict", "aid-dynamic"},
+                }
+                self.removed_album = []
+                self.added_album = []
+
+            def get_albums(self): return self.albums
+            def get_album_assets(self, aid): return set(self.album_to_assets.get(aid, set()))
+            def remove_assets_from_album(self, aid, aids):
+                self.removed_album.append((aid, aids))
+                for a in aids:
+                    self.album_to_assets.get(aid, set()).discard(a)
+                return len(aids)
+            def add_assets_to_album(self, aid, aids):
+                self.added_album.append((aid, aids))
+                for a in aids:
+                    self.album_to_assets.setdefault(aid, set()).add(a)
+                return len(aids), aids
+
+        test_ckpt_file = TEST_DIR / "test_album_pull.sqlite"
+        t_ckpt = Checkpoint(test_ckpt_file)
+        t_ckpt.clear()
+
+        # Existing synced static video
+        t_ckpt.record("aid-static", {"asset_id": "aid-static", "decision": "static", "synced_album": "[Static] Videos", "synced_at": "2026-10-01"})
+        # Conflicted video (present in both Static & Dynamic, PLUS user album 'Pets')
+        t_ckpt.record("aid-conflict", {"asset_id": "aid-conflict", "decision": "static", "synced_album": "[Static] Videos", "synced_at": "2026-10-01"})
+        # Newly detected video waiting for initial sync
+        t_ckpt.record("aid-newly-detected", {"asset_id": "aid-newly-detected", "decision": "static", "synced_album": None, "synced_at": None})
+
+        mock_album_client = MockAlbumImmichClient()
+        pull_immich_to_checkpoint(mock_album_client, t_ckpt, dry_run=False)
+
+        assert t_ckpt.get("aid-static")["decision"] == "static"
+        assert t_ckpt.get("aid-conflict")["decision"] == "review", "Conflicted asset should resolve to review"
+        # Removed from static and dynamic classification albums
+        assert ("a-static", ["aid-conflict"]) in mock_album_client.removed_album
+        assert ("a-dynamic", ["aid-conflict"]) in mock_album_client.removed_album
+        # Added to review album
+        assert ("a-review", ["aid-conflict"]) in mock_album_client.added_album
+        # User album 'Pets' MUST NOT BE TOUCHED
+        for aid_rem, _ in mock_album_client.removed_album:
+            assert aid_rem != "a-pets", "User album 'Pets' must never be modified by conflict resolution!"
+        assert "aid-conflict" in mock_album_client.album_to_assets["a-pets"], "User album 'Pets' must still contain the video!"
+        assert t_ckpt.get("aid-newly-detected")["decision"] == "static", "Newly detected unsynced video must remain untouched"
+        print("✅ Album-authoritative pull, conflict resolution, and user album safety verified!")
+
+        # Test 11: On-Demand Webhook Pull Endpoint (/webhook/pull)
+        print("\n--- Test 11: On-Demand Webhook Pull Endpoint (/webhook/pull) ---")
+        pull_server = WebhookServer(
+            ("127.0.0.1", 0),
+            WebhookRequestHandler,
+            client=mock_album_client,
+            ckpt=t_ckpt,
+            thresholds=thresholds,
+            folder=TEST_DIR,
+            remote_prefix=None,
+            local_prefix=None,
+            secret="test_secret_123",
+            dry_run=False,
+        )
+        pull_port = pull_server.server_address[1]
+        pull_server_thread = threading.Thread(target=pull_server.serve_forever, daemon=True)
+        pull_server_thread.start()
+        pull_worker_thread = threading.Thread(target=_worker_loop, args=(pull_server, 1), daemon=True)
+        pull_worker_thread.start()
+
+        # Simulate user moving aid-static from [Static] Videos to [Dynamic] Videos in Immich UI
+        mock_album_client.album_to_assets["a-static"].discard("aid-static")
+        mock_album_client.album_to_assets["a-dynamic"].add("aid-static")
+
+        req_pull = urllib.request.Request(
+            f"http://127.0.0.1:{pull_port}/webhook/pull",
+            headers={"Content-Type": "application/json", "X-Webhook-Secret": "test_secret_123"},
+            data=b"{}",
+            method="POST"
+        )
+        with urllib.request.urlopen(req_pull, timeout=5) as resp:
+            assert resp.status == 200
+            data = json.loads(resp.read().decode())
+            assert data["status"] == "ok"
+            print("   • On-demand /webhook/pull accepted: OK (200 OK)")
+
+        # Verify aid-static was updated to dynamic in SQLite
+        assert t_ckpt.get("aid-static")["decision"] == "dynamic"
+        assert t_ckpt.get("aid-static")["user_curated"] == 1
+        print("   • On-demand album pull synced correctly: [STATIC] ➔ [DYNAMIC] in SQLite!")
+
+        pull_server.shutdown()
+        pull_server.server_close()
+        print("✅ On-demand /webhook/pull verified end-to-end!")
 
         print("\n========================================")
         print("🎉 ALL TESTS PASSED SUCCESSFULLY!")

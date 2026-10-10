@@ -28,7 +28,11 @@ from immich_static.core import (
     extract_one_frame,
     resolve_local_video_path,
 )
-from immich_static.sync import sync_single_asset
+from immich_static.sync import (
+    pull_immich_to_checkpoint,
+    reconcile_single_asset_albums,
+    sync_single_asset,
+)
 
 _server_stop_event = threading.Event()
 _start_time = time.time()
@@ -147,6 +151,38 @@ def extract_asset_info_from_payload(payload: Any) -> Tuple[Optional[str], Dict[s
     return None, payload
 
 
+def extract_webhook_event_info(payload: Any) -> Tuple[List[str], Dict[str, Any], bool]:
+    """
+    Extracts a list of asset IDs, metadata dictionary, and a boolean indicating if it is a tag event.
+    Supports single asset events, batch asset events (ids: [...]), and Immich Workflow actions.
+    """
+    if not isinstance(payload, dict):
+        return [], {}, False
+
+    # Check if payload indicates tag action
+    action = str(payload.get("action", "") or payload.get("event", "") or payload.get("type", "")).lower()
+    is_tag_event = any(k in action for k in ("tag", "label")) or any(k in payload for k in ("tagId", "tagName", "tags", "tag"))
+
+    asset_ids: List[str] = []
+    asset_data: Dict[str, Any] = dict(payload)
+
+    # 1. Batch IDs: ids: [...] or assetIds: [...]
+    raw_ids = payload.get("ids") or payload.get("assetIds")
+    if isinstance(raw_ids, list):
+        asset_ids.extend(str(x) for x in raw_ids if x)
+    elif payload.get("data") and isinstance(payload["data"].get("ids"), list):
+        asset_ids.extend(str(x) for x in payload["data"]["ids"] if x)
+
+    # 2. Single asset extraction if no batch list found
+    if not asset_ids:
+        aid, data = extract_asset_info_from_payload(payload)
+        if aid:
+            asset_ids.append(aid)
+            asset_data = data
+
+    return asset_ids, asset_data, is_tag_event
+
+
 class WebhookServer(ThreadingHTTPServer):
     """Threading HTTP server with worker queue and configuration context."""
 
@@ -257,13 +293,30 @@ class WebhookRequestHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", 0))
         _log(f"📩 [HTTP] {self._client_ip()} -> POST {self.path} ({content_length} bytes)")
 
-        if parsed.path not in ("/webhook", "/webhook/"):
+        valid_paths = (
+            "/webhook", "/webhook/",
+            "/webhook/pull", "/webhook/pull/",
+            "/webhook/album", "/webhook/album/",
+            "/webhook/detect", "/webhook/detect/",
+        )
+        if parsed.path not in valid_paths:
             self._send_json(404, {"error": f"Endpoint not found: {parsed.path}"})
             return
 
         if not self._is_authorized():
             _log("⚠️  [AUTH] Unauthorized webhook request rejected (invalid secret).")
             self._send_json(401, {"error": "Unauthorized. Provide valid secret token."})
+            return
+
+        # On-demand album pull endpoint
+        if parsed.path in ("/webhook/pull", "/webhook/pull/"):
+            _log(f"📥 [PULL] Triggered on-demand album pull via webhook...")
+            try:
+                res = pull_immich_to_checkpoint(self.server.client, self.server.ckpt, dry_run=self.server.dry_run)
+                self._send_json(200, res)
+            except Exception as e:
+                _log(f"❌ [PULL-ERROR] Failed to execute pull: {e}")
+                self._send_json(500, {"status": "error", "message": str(e)})
             return
 
         # Parse request body
@@ -278,41 +331,90 @@ class WebhookRequestHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": f"Malformed JSON: {e}"})
             return
 
-        asset_id, asset_data = extract_asset_info_from_payload(payload)
-        if not asset_id:
+        asset_ids, asset_data, _ = extract_webhook_event_info(payload)
+        if not asset_ids:
             _log(f"⚠️  [WEBHOOK] Received webhook with no identifiable asset ID: {payload}")
             self._send_json(400, {"error": "No asset ID found in webhook payload"})
             return
 
-        # Quick pre-filter: if payload explicitly declares non-video asset
+        if parsed.path in ("/webhook/album", "/webhook/album/"):
+            for aid in asset_ids:
+                self.server.worker_queue.put(("album", aid, asset_data))
+            qsize = self.server.worker_queue.qsize()
+            _log(f"📁 [QUEUE] Album reconciliation enqueued for {len(asset_ids)} asset(s) (queue depth: {qsize})")
+            self._send_json(202, {
+                "status": "queued",
+                "action": "album_reconcile",
+                "asset_ids": asset_ids,
+                "queue_depth": qsize,
+            })
+            return
+
+        # Video detection action
         asset_type = asset_data.get("type")
-        if asset_type and asset_type.upper() not in ("VIDEO", "LIVE_PHOTO_VIDEO"):
-            _log(f"ℹ️  [FILTER] Skipped non-video asset {asset_id} (type: {asset_type})")
+        if asset_type and str(asset_type).upper() not in ("VIDEO", "LIVE_PHOTO_VIDEO"):
+            _log(f"ℹ️  [FILTER] Skipped non-video asset {asset_ids[0]} (type: {asset_type})")
             self._send_json(200, {"status": "ignored", "reason": f"Asset type is {asset_type}, not VIDEO"})
             return
 
-        # Enqueue for asynchronous background processing to prevent webhook timeout
-        self.server.worker_queue.put((asset_id, asset_data))
+        for aid in asset_ids:
+            self.server.worker_queue.put(("detect", aid, asset_data))
         qsize = self.server.worker_queue.qsize()
-        _log(f"📥 [QUEUE] Asset {asset_id} enqueued successfully (queue depth: {qsize})")
-
-        self._send_json(202, {"status": "queued", "asset_id": asset_id, "queue_depth": qsize})
+        _log(f"📥 [QUEUE] Video detection enqueued for {len(asset_ids)} asset(s) (queue depth: {qsize})")
+        self._send_json(202, {
+            "status": "queued",
+            "action": "detect",
+            "asset_ids": asset_ids,
+            "queue_depth": qsize,
+        })
 
 
 def _worker_loop(server: WebhookServer, worker_id: int):
     """Background consumer thread that processes video assets from the queue."""
     while not _server_stop_event.is_set():
         try:
-            asset_id, asset_data = server.worker_queue.get(timeout=1.0)
+            item = server.worker_queue.get(timeout=1.0)
         except queue.Empty:
             continue
 
         try:
-            _process_queued_asset(server, asset_id, asset_data)
+            if isinstance(item, tuple) and len(item) == 3:
+                event_type, asset_id, asset_data = item
+                if event_type == "album":
+                    _process_queued_album_event(server, asset_id, asset_data)
+                else:
+                    _process_queued_asset(server, asset_id, asset_data)
+            elif isinstance(item, tuple) and len(item) == 2:
+                asset_id, asset_data = item
+                _process_queued_asset(server, asset_id, asset_data)
         except Exception as e:
-            print(f"❌ [WORKER-{worker_id}] Error processing asset {asset_id}: {e}")
+            print(f"❌ [WORKER-{worker_id}] Error processing queue item: {e}")
         finally:
             server.worker_queue.task_done()
+
+
+def _process_queued_album_event(server: WebhookServer, asset_id: str, asset_data: Dict[str, Any]):
+    """Processes an album reconciliation event in real-time."""
+    _log(f"📁 [ALBUM-RECONCILE] Processing album reconciliation for asset {asset_id}...")
+    try:
+        res = reconcile_single_asset_albums(
+            client=server.client,
+            ckpt=server.ckpt,
+            asset_id=asset_id,
+            dry_run=server.dry_run,
+        )
+        dec = res.get("decision")
+        conflict = res.get("conflict")
+        album_changes = res.get("album_changes", [])
+        changes_str = ", ".join(album_changes) if album_changes else "no album changes required"
+        if conflict:
+            _log(f"⚠️  [ALBUM-CONFLICT] Asset {asset_id} was in multiple classification albums -> resolved to REVIEW | {changes_str}")
+        elif dec:
+            _log(f"✅ [ALBUM-SYNC] Asset {asset_id} decision -> {dec.upper()} | {changes_str}")
+        else:
+            _log(f"ℹ️  [ALBUM-SYNC] Asset {asset_id}: {res.get('reason', 'no change')}")
+    except Exception as e:
+        _log(f"❌ [ALBUM-ERROR] Failed to reconcile albums for asset {asset_id}: {e}")
 
 
 def _process_queued_asset(server: WebhookServer, asset_id: str, asset_data: Dict[str, Any]):
@@ -397,18 +499,17 @@ def _process_queued_asset(server: WebhookServer, asset_id: str, asset_data: Dict
     duration = row.get("duration_s", "?")
     _log(f"📊 [DECISION] '{orig_name}' -> {decision.upper()} | motion: {motion} | active_zones: {zones} | duration: {duration}s")
 
-    # 4. Apply targeted tag & album sync to Immich
+    # 4. Add to matching Immich classification album
     if decision in ("static", "review", "dynamic"):
         sync_res = sync_single_asset(
             client=client,
             asset_id=asset_id,
             decision=decision,
-            sync_tags=True,
             sync_albums=True,
             include_dynamic=server.include_dynamic,
             dry_run=server.dry_run,
         )
-        _log(f"🏷️  [SYNC] Immich updated for '{orig_name}': Tagged={sync_res.get('tagged')} | AlbumAdded={sync_res.get('album_added')}")
+        _log(f"📁 [SYNC] Immich album updated for '{orig_name}': AlbumAdded={sync_res.get('album_added')}")
 
     # 5. Optional sharpest frame extraction
     if server.extract_frame and decision == "static" and video_path.is_file():
@@ -555,7 +656,8 @@ def run_serve(args: Any):
 
     print("\n" + "=" * 65)
     print("🚀 Immich Static Webhook Daemon running!")
-    print(f"   • Listening on     : http://{host}:{port}/webhook")
+    print(f"   • Detection webhook: http://{host}:{port}/webhook")
+    print(f"   • On-demand pull   : http://{host}:{port}/webhook/pull")
     print(f"   • Health check     : http://{host}:{port}/health")
     print(f"   • Authentication   : {'🔒 Secret enforced' if secret else '⚠️  Public (no secret set)'}")
     print(f"   • Local mount      : {folder if folder else '📡 API stream / download fallback'}")

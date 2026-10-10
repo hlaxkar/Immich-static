@@ -217,6 +217,21 @@ class ImmichClient:
                 success_ids.extend(batch)
         return len(success_ids), success_ids
 
+    def remove_assets_from_album(self, album_id: str, asset_ids: List[str]) -> int:
+        """Removes asset IDs from an album in batches of 500."""
+        if not asset_ids:
+            return 0
+        removed_count = 0
+        batch_size = 500
+        for i in range(0, len(asset_ids), batch_size):
+            batch = asset_ids[i:i + batch_size]
+            try:
+                self._request("DELETE", f"/api/albums/{album_id}/assets", {"ids": batch})
+                removed_count += len(batch)
+            except Exception as e:
+                print(f"⚠️  Failed to remove batch from album {album_id}: {e}")
+        return removed_count
+
     def get_assets_total_size(self, asset_ids: Set[str], max_workers: int = 20) -> int:
         """Calculates exact total file size in bytes for a set of asset IDs."""
         if not asset_ids:
@@ -250,12 +265,12 @@ class ImmichClient:
         except Exception:
             return []
 
-    def create_tag(self, tag_name: str) -> Dict[str, Any]:
-        """Creates a new tag."""
+    def delete_tag(self, tag_id: str):
+        """Deletes a tag by ID from Immich."""
         try:
-            return self._request("POST", "/api/tags", {"name": tag_name, "type": "CUSTOM"})
-        except Exception:
-            return self._request("POST", "/api/tags", {"name": tag_name})
+            self._request("DELETE", f"/api/tags/{tag_id}")
+        except Exception as e:
+            print(f"⚠️  Failed to delete tag {tag_id}: {e}")
 
     def untag_assets(self, tag_id: str, asset_ids: List[str]):
         """Removes a tag from asset IDs in batches."""

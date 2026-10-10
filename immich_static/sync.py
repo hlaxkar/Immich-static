@@ -4,6 +4,7 @@ immich_static.sync — Immich REST API bridge for syncing tags, albums, metrics,
 
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -53,55 +54,70 @@ def get_or_create_album_id(client: ImmichClient, album_name: str) -> str:
     return aid
 
 
+def cleanup_legacy_tags(client: ImmichClient) -> int:
+    """Deletes legacy classifier tags (video:static, video:review, video:dynamic) from Immich."""
+    tag_names = {
+        os.environ.get("TAG_STATIC", "video:static"),
+        os.environ.get("TAG_REVIEW", "video:review"),
+        os.environ.get("TAG_DYNAMIC", "video:dynamic"),
+    }
+    existing_tags = client.get_tags()
+    deleted_count = 0
+    for t in existing_tags:
+        if isinstance(t, dict) and t.get("name") in tag_names:
+            tid = t.get("id")
+            tname = t.get("name")
+            print(f"🧹 Deleting legacy tag '{tname}' (ID: {tid})...")
+            client.delete_tag(tid)
+            deleted_count += 1
+    if deleted_count > 0:
+        print(f"✅ Removed {deleted_count} legacy classification tag(s) from Immich.\n")
+    else:
+        print("ℹ️  No legacy classification tags found in Immich.\n")
+    return deleted_count
+
+
 def sync_single_asset(
     client: ImmichClient,
     asset_id: str,
     decision: str,
-    sync_tags: bool = True,
     sync_albums: bool = True,
     include_dynamic: bool = True,
     dry_run: bool = False,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """
-    Directly syncs a single classified video asset to Immich Tags and Albums in O(1) time.
+    Directly syncs a single classified video asset to Immich Albums in O(1) time.
+    Adds asset to target album and removes it from opposing classification albums.
     """
     if decision not in ("static", "review", "dynamic"):
         return {"status": "skipped", "reason": f"unhandled decision: {decision}"}
     if decision == "dynamic" and not include_dynamic:
         return {"status": "skipped", "reason": "dynamic excluded"}
 
-    tag_name_map = {
-        "static": os.environ.get("TAG_STATIC", "video:static"),
-        "review": os.environ.get("TAG_REVIEW", "video:review"),
-        "dynamic": os.environ.get("TAG_DYNAMIC", "video:dynamic"),
-    }
     album_name_map = {
-        "static": "[Static] Videos",
-        "review": "[Review] Videos",
-        "dynamic": "[Dynamic] Videos",
+        "static": os.environ.get("ALBUM_STATIC", "[Static] Videos"),
+        "review": os.environ.get("ALBUM_REVIEW", "[Review] Videos"),
+        "dynamic": os.environ.get("ALBUM_DYNAMIC", "[Dynamic] Videos"),
     }
 
-    target_tag = tag_name_map[decision]
     target_album = album_name_map[decision]
-
-    res = {"asset_id": asset_id, "decision": decision, "tagged": False, "album_added": False}
-
-    if sync_tags:
-        if dry_run:
-            print(f"   🔍 [DRY-RUN] Would tag {asset_id} as '{target_tag}'")
-        else:
-            try:
-                tid = get_or_create_tag_id(client, target_tag)
-                client.tag_assets(tid, [asset_id])
-                res["tagged"] = True
-            except Exception as e:
-                print(f"⚠️  Failed to tag asset {asset_id} as '{target_tag}': {e}")
+    res = {"asset_id": asset_id, "decision": decision, "album_added": False}
 
     if sync_albums:
         if dry_run:
             print(f"   🔍 [DRY-RUN] Would add {asset_id} to album '{target_album}'")
         else:
             try:
+                # Remove from opposing classification albums first to prevent multi-album overlap
+                for opp_dec, opp_name in album_name_map.items():
+                    if opp_dec != decision:
+                        try:
+                            opp_aid = get_or_create_album_id(client, opp_name)
+                            client.remove_assets_from_album(opp_aid, [asset_id])
+                        except Exception:
+                            pass
+
                 aid = get_or_create_album_id(client, target_album)
                 added_count, _ = client.add_assets_to_album(aid, [asset_id])
                 res["album_added"] = (added_count > 0)
@@ -111,16 +127,104 @@ def sync_single_asset(
     return res
 
 
+def reconcile_single_asset_albums(
+    client: ImmichClient,
+    ckpt: Checkpoint,
+    asset_id: str,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """
+    Reconciles albums for a single asset.
+    If present in multiple classification albums, resolves to [Review] Videos only.
+    Non-classification user albums (e.g. Pets) are never modified.
+    """
+    album_name_map = {
+        "static": os.environ.get("ALBUM_STATIC", "[Static] Videos"),
+        "review": os.environ.get("ALBUM_REVIEW", "[Review] Videos"),
+        "dynamic": os.environ.get("ALBUM_DYNAMIC", "[Dynamic] Videos"),
+    }
+
+    existing_albums = client.get_albums()
+    albums_by_name = {a.get("albumName"): a for a in existing_albums if isinstance(a, dict) and a.get("albumName")}
+
+    active_albums = []
+    album_objs = {}
+    for dec, alb_name in album_name_map.items():
+        alb = albums_by_name.get(alb_name)
+        if alb:
+            album_objs[dec] = alb
+            assets_in_alb = client.get_album_assets(alb["id"])
+            if asset_id in assets_in_alb:
+                active_albums.append(dec)
+
+    db_row = ckpt.get(asset_id)
+    now_iso = datetime.now().isoformat()
+
+    result: Dict[str, Any] = {
+        "status": "ok",
+        "asset_id": asset_id,
+        "active_albums": active_albums,
+        "decision": None,
+        "conflict": False,
+        "album_changes": [],
+    }
+
+    if len(active_albums) > 1:
+        # CONFLICT: Present in multiple classification albums!
+        result["conflict"] = True
+        result["decision"] = "review"
+        target_album_name = album_name_map["review"]
+
+        if not dry_run:
+            # 1. Remove from Static and Dynamic albums ONLY (Pets/etc untouched)
+            for dec in active_albums:
+                if dec != "review" and dec in album_objs:
+                    client.remove_assets_from_album(album_objs[dec]["id"], [asset_id])
+                    result["album_changes"].append(f"removed from {album_name_map[dec]}")
+
+            # 2. Add to Review album
+            rev_alb = album_objs.get("review")
+            if not rev_alb:
+                rev_alb = client.create_album(target_album_name)
+            client.add_assets_to_album(rev_alb["id"], [asset_id])
+            result["album_changes"].append(f"added to {target_album_name}")
+
+            # 3. Update SQLite
+            ckpt.update_decision(asset_id, "review", user_curated=1)
+            ckpt.update_sync_status(asset_id, target_album_name, now_iso)
+
+    elif len(active_albums) == 1:
+        target_decision = active_albums[0]
+        target_album_name = album_name_map[target_decision]
+        result["decision"] = target_decision
+
+        if not dry_run:
+            ckpt.update_decision(asset_id, target_decision, user_curated=1)
+            ckpt.update_sync_status(asset_id, target_album_name, now_iso)
+
+    else:
+        # len(active_albums) == 0: Not in any classification album
+        if db_row and (db_row.get("synced_album") or db_row.get("synced_tag") or db_row.get("synced_at")):
+            result["decision"] = "dynamic"
+            if not dry_run:
+                ckpt.update_decision(asset_id, "dynamic", user_curated=1)
+                ckpt.update_sync_status(asset_id, None, now_iso)
+        else:
+            result["status"] = "skipped"
+            result["reason"] = "unsynced asset has no classification album"
+
+    return result
+
+
 def sync_immich(
     client: ImmichClient,
     ckpt: Checkpoint,
     dry_run: bool = False,
-    sync_tags: bool = True,
     sync_albums: bool = True,
     include_dynamic: bool = False,
     prune: bool = False,
 ):
-    """Syncs classified assets from SQLite checkpoint to Immich Tags and Albums."""
+    """Syncs classified assets from SQLite checkpoint to Immich Albums."""
     # 1. Fetch Immich Assets & Build Lookup Maps
     immich_videos = client.get_all_video_assets()
 
@@ -210,64 +314,28 @@ def sync_immich(
         print(f"   • Dynamic candidates    : {len(grouped_asset_ids['dynamic'])}")
     print()
 
-    tag_name_map = {
-        "static": os.environ.get("TAG_STATIC", "video:static"),
-        "review": os.environ.get("TAG_REVIEW", "video:review"),
-        "dynamic": os.environ.get("TAG_DYNAMIC", "video:dynamic"),
-    }
-
     album_name_map = {
         "static": "[Static] Videos",
         "review": "[Review] Videos",
         "dynamic": "[Dynamic] Videos",
     }
 
-    # 3. Apply Tags to Assets
-    if sync_tags:
-        print("🏷  Syncing Immich Tags...")
-        existing_tags = client.get_tags()
-        tags_by_name = {t.get("name"): t for t in existing_tags}
-
-        for decision, asset_ids in grouped_asset_ids.items():
-            if not asset_ids:
-                continue
-            target_tag_name = tag_name_map[decision]
-
-            tag = tags_by_name.get(target_tag_name)
-            if not tag:
-                if dry_run:
-                    print(f"   🔍 [DRY-RUN] Would create Tag '{target_tag_name}'")
-                    tag_id = "dry-run-tag-id"
-                else:
-                    print(f"   🏷  Creating Tag '{target_tag_name}'...")
-                    tag = client.create_tag(target_tag_name)
-                    tag_id = tag["id"]
-            else:
-                tag_id = tag["id"]
-
-            if dry_run:
-                print(f"   🔍 [DRY-RUN] Would apply tag '{target_tag_name}' to {len(asset_ids)} assets")
-            else:
-                client.tag_assets(tag_id, asset_ids)
-                print(f"   ✅ Tagged '{target_tag_name}' ({len(asset_ids)} assets)")
-        print()
-
-    # 4. Populate Albums
+    # 3. Synchronize Immich Managed Albums
     if sync_albums:
         print("📁 Syncing Immich Albums...")
         existing_albums = client.get_albums()
-        albums_by_name = {a.get("albumName"): a for a in existing_albums}
+        albums_by_name = {a.get("albumName"): a for a in existing_albums if isinstance(a, dict) and a.get("albumName")}
 
-        for decision, asset_ids in grouped_asset_ids.items():
-            if not asset_ids:
-                continue
+        album_ids: Dict[str, str] = {}
+        album_existing_assets: Dict[str, Set[str]] = {}
+
+        for decision in ("static", "review", "dynamic"):
             target_album_name = album_name_map[decision]
-
             album = albums_by_name.get(target_album_name)
             if not album:
                 if dry_run:
                     print(f"   🔍 [DRY-RUN] Would create Album '{target_album_name}'")
-                    album_id = "dry-run-album-id"
+                    album_id = f"dry-run-{decision}-id"
                     existing_in_album = set()
                 else:
                     print(f"   📁 Creating Album '{target_album_name}'...")
@@ -277,6 +345,26 @@ def sync_immich(
             else:
                 album_id = album["id"]
                 existing_in_album = client.get_album_assets(album_id) if not dry_run else set()
+
+            album_ids[decision] = album_id
+            album_existing_assets[decision] = existing_in_album
+
+        for decision, asset_ids in grouped_asset_ids.items():
+            if not asset_ids:
+                continue
+            target_album_name = album_name_map[decision]
+            album_id = album_ids[decision]
+            existing_in_album = album_existing_assets[decision]
+
+            # Remove reclassified assets from opposing classification albums (Pets/etc untouched)
+            if not dry_run:
+                for opp_decision in ("static", "review", "dynamic"):
+                    if opp_decision != decision:
+                        opp_existing = album_existing_assets.get(opp_decision, set())
+                        to_remove = [aid for aid in asset_ids if aid in opp_existing]
+                        if to_remove:
+                            client.remove_assets_from_album(album_ids[opp_decision], to_remove)
+                            opp_existing.difference_update(to_remove)
 
             to_add = []
             for aid in asset_ids:
@@ -300,6 +388,17 @@ def sync_immich(
                     print(f"      ✅ Added {added_count} assets to '{target_album_name}'.")
         print()
 
+    # 4. Track Sync State in SQLite Checkpoint
+    if not dry_run and sync_albums:
+        now_iso = datetime.now().isoformat()
+        sync_updates = []
+        for decision, asset_ids in grouped_asset_ids.items():
+            target_album_name = album_name_map[decision]
+            for aid in asset_ids:
+                sync_updates.append((aid, target_album_name, now_iso))
+        if sync_updates:
+            ckpt.update_sync_status_batch(sync_updates)
+
 
 def restore_checkpoint_decisions(ckpt: Checkpoint, sensitivity: str = "medium") -> int:
     """Restores classifications in SQLite checkpoint database from recorded motion scores."""
@@ -308,6 +407,7 @@ def restore_checkpoint_decisions(ckpt: Checkpoint, sensitivity: str = "medium") 
 
     rows = ckpt.all_rows()
     restored_counts = {"static": 0, "review": 0, "dynamic": 0}
+    batch_updates = []
 
     for r in rows:
         g_str = r.get("global_motion_score")
@@ -330,8 +430,13 @@ def restore_checkpoint_decisions(ckpt: Checkpoint, sensitivity: str = "medium") 
 
         aid = r.get("asset_id")
         fn = r.get("filename")
-        ckpt.update_decision(aid or fn, new_dec, new_confidence=conf_str)
-        restored_counts[new_dec] += 1
+        key = aid or fn
+        if key:
+            batch_updates.append((key, new_dec, conf_str))
+            restored_counts[new_dec] += 1
+
+    if batch_updates:
+        ckpt.update_decisions_batch(batch_updates)
 
     print("🔄 Restored Checkpoint Classifications from Raw Motion Scores:")
     print(f"   • Static  : {restored_counts['static']}")
@@ -341,139 +446,201 @@ def restore_checkpoint_decisions(ckpt: Checkpoint, sensitivity: str = "medium") 
     return sum(restored_counts.values())
 
 
-def pull_albums_to_checkpoint(
+def pull_immich_to_checkpoint(
     client: ImmichClient,
     ckpt: Checkpoint,
     dry_run: bool = False,
-    sync_tags: bool = True,
-):
-    """Pulls classification changes from Immich albums back into local SQLite database."""
-    print("📥 Pulling album state from Immich into local SQLite database...")
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """
+    Pulls classification state from Immich Albums into local SQLite database.
+    Albums are authoritative. Multi-album conflicts resolve to [Review] Videos only.
+    Non-classification user albums (e.g. Pets, Vacation) are completely ignored.
+    Preserves newly detected local videos that have not yet been synced.
+    """
+    print("📥 Pulling classification albums from Immich into local SQLite database...")
+
+    album_name_map = {
+        "static": os.environ.get("ALBUM_STATIC", "[Static] Videos"),
+        "review": os.environ.get("ALBUM_REVIEW", "[Review] Videos"),
+        "dynamic": os.environ.get("ALBUM_DYNAMIC", "[Dynamic] Videos"),
+    }
+
     albums = client.get_albums()
-    albums_by_name = {a.get("albumName"): a for a in albums}
+    albums_by_name = {a.get("albumName"): a for a in albums if isinstance(a, dict) and a.get("albumName")}
 
-    static_name = os.environ.get("ALBUM_STATIC", "[Static] Videos")
-    review_name = os.environ.get("ALBUM_REVIEW", "[Review] Videos")
-    dynamic_name = os.environ.get("ALBUM_DYNAMIC", "[Dynamic] Videos")
-
-    static_album = albums_by_name.get(static_name)
-    review_album = albums_by_name.get(review_name)
-    dynamic_album = albums_by_name.get(dynamic_name)
+    static_album = albums_by_name.get(album_name_map["static"])
+    review_album = albums_by_name.get(album_name_map["review"])
+    dynamic_album = albums_by_name.get(album_name_map["dynamic"])
 
     if not static_album and not review_album and not dynamic_album:
-        print(f"❌ Error: None of the classification albums ('{static_name}', '{review_name}', '{dynamic_name}') exist in Immich.")
-        print("   Did you run `immich-static sync` to push classifications and create the albums first?")
-        print("   Aborting pull to protect local database.")
-        return
+        print(f"❌ Error: None of the classification albums ('{album_name_map['static']}', '{album_name_map['review']}', '{album_name_map['dynamic']}') exist in Immich.")
+        print("   Did you run `immich-static sync` first to initialize albums?")
+        return {"status": "error", "message": "No classification albums found"}
 
     static_ids = client.get_album_assets(static_album["id"]) if static_album else set()
     review_ids = client.get_album_assets(review_album["id"]) if review_album else set()
     dynamic_ids = client.get_album_assets(dynamic_album["id"]) if dynamic_album else set()
 
-    total_album_assets = len(static_ids) + len(review_ids) + len(dynamic_ids)
-    print(f"   • Album '{static_name}': {len(static_ids)} assets")
-    print(f"   • Album '{review_name}': {len(review_ids)} assets")
-    print(f"   • Album '{dynamic_name}': {len(dynamic_ids)} assets")
+    print(f"   • Album '{album_name_map['static']}': {len(static_ids)} assets")
+    print(f"   • Album '{album_name_map['review']}': {len(review_ids)} assets")
+    print(f"   • Album '{album_name_map['dynamic']}': {len(dynamic_ids)} assets")
     print()
-
-    if total_album_assets == 0:
-        print("⚠️  Warning: The albums in Immich currently contain 0 assets.")
-        print("   Did you populate the albums first using `immich-static sync`?")
-        print("   Aborting pull to avoid accidentally clearing local classifications.")
-        return
 
     all_rows = ckpt.all_rows()
     if not all_rows:
         print("⚠️  Checkpoint database is empty. No local records to update.")
-        return
+        return {"status": "ok", "updated": 0}
 
-    changes: Dict[str, List[Tuple[str, str, str]]] = {
-        "static_to_dynamic": [],
-        "static_to_review": [],
-        "review_to_static": [],
-        "review_to_dynamic": [],
-        "dynamic_to_static": [],
-        "dynamic_to_review": [],
+    row_by_aid = {r.get("asset_id"): r for r in all_rows if r.get("asset_id")}
+
+    # Candidates:
+    # 1. Any asset having membership in at least one of the 3 managed classification albums
+    # 2. Any asset in SQLite that was previously synced (synced_album, synced_tag, or synced_at set)
+    managed_union = static_ids | review_ids | dynamic_ids
+    previously_synced_aids = {
+        r.get("asset_id") for r in all_rows
+        if r.get("asset_id") and (r.get("synced_album") or r.get("synced_tag") or r.get("synced_at"))
     }
+    candidate_aids = managed_union | previously_synced_aids
 
-    updated_count = 0
+    changes: Dict[str, List[Tuple[str, str, str]]] = {}
+    conflicts_resolved: List[Tuple[str, str, List[str]]] = []
+    album_additions: Dict[str, List[str]] = {"static": [], "review": [], "dynamic": []}
+    album_removals: Dict[str, List[str]] = {"static": [], "review": [], "dynamic": []}
+    protected_unsynced_count = 0
 
-    for r in all_rows:
-        aid = r.get("asset_id")
-        old_decision = r.get("decision", "")
-        if not aid:
-            continue
+    now_iso = datetime.now().isoformat()
+    db_decision_updates: List[Tuple[str, str, Optional[str]]] = []
+    db_sync_updates: List[Tuple[str, Optional[str], Optional[str]]] = []
+
+    for aid in candidate_aids:
+        r = row_by_aid.get(aid)
+        old_decision = r.get("decision", "") if r else None
+        fname = (r.get("original_file_name") or Path(r.get("filename", "")).name) if r else f"asset-{aid[:8]}"
+
+        active_albums = []
+        if aid in static_ids:
+            active_albums.append("static")
+        if aid in review_ids:
+            active_albums.append("review")
+        if aid in dynamic_ids:
+            active_albums.append("dynamic")
 
         target_decision = None
-        if aid in static_ids:
-            target_decision = "static"
-        elif aid in review_ids:
+        target_album_name = None
+
+        if len(active_albums) > 1:
+            # CONFLICT: Asset is in multiple classification albums!
+            # Resolve to [Review] only, and remove from other classification albums (Pets/etc untouched).
             target_decision = "review"
-        elif aid in dynamic_ids:
-            target_decision = "dynamic"
-        elif old_decision == "static" and static_album and len(static_ids) > 0 and aid not in static_ids:
-            target_decision = "dynamic"
+            target_album_name = album_name_map["review"]
+            conflicts_resolved.append((aid, fname, active_albums))
 
-        if target_decision and target_decision != old_decision:
-            change_key = f"{old_decision}_to_{target_decision}"
-            fname = r.get("original_file_name") or Path(r.get("filename", "")).name
-            if change_key in changes:
-                changes[change_key].append((aid, fname, target_decision))
+            if "static" in active_albums:
+                album_removals["static"].append(aid)
+            if "dynamic" in active_albums:
+                album_removals["dynamic"].append(aid)
+            if "review" not in active_albums:
+                album_additions["review"].append(aid)
+
+        elif len(active_albums) == 1:
+            # Exactly one classification album present
+            target_decision = active_albums[0]
+            target_album_name = album_name_map[target_decision]
+
+        else:
+            # len(active_albums) == 0: Not in any of the 3 classification albums!
+            if r and (r.get("synced_album") or r.get("synced_tag") or r.get("synced_at")):
+                # Was previously synced, but user removed it from albums in Immich UI!
+                target_decision = "dynamic"
+                target_album_name = None
             else:
+                # Never synced: preserve newly detected state!
+                continue
+
+        # Record changes for SQLite update
+        if r:
+            if target_decision and target_decision != old_decision:
+                change_key = f"{old_decision}_to_{target_decision}"
                 changes.setdefault(change_key, []).append((aid, fname, target_decision))
+                db_decision_updates.append((aid, target_decision, None))
+            db_sync_updates.append((aid, target_album_name, now_iso))
 
-            if not dry_run:
-                ckpt.update_decision(aid, target_decision)
-            updated_count += 1
+    # Calculate newly detected videos preserved
+    for r in all_rows:
+        aid = r.get("asset_id")
+        if aid and aid not in candidate_aids and not r.get("synced_album") and not r.get("synced_tag") and not r.get("synced_at"):
+            protected_unsynced_count += 1
 
+    # Execute DB updates
+    if not dry_run:
+        if db_decision_updates:
+            ckpt.update_decisions_batch(db_decision_updates, user_curated=1)
+        if db_sync_updates:
+            ckpt.update_sync_status_batch(db_sync_updates)
+
+    # Execute Album Reconciliations for Conflicted Assets (Pets/etc untouched)
+    if not dry_run:
+        if album_removals["static"] and static_album:
+            client.remove_assets_from_album(static_album["id"], album_removals["static"])
+        if album_removals["dynamic"] and dynamic_album:
+            client.remove_assets_from_album(dynamic_album["id"], album_removals["dynamic"])
+        if album_additions["review"]:
+            if not review_album:
+                review_album = client.create_album(album_name_map["review"])
+            client.add_assets_to_album(review_album["id"], album_additions["review"])
+
+    # Output Summary
     print("🔄 Synchronization Summary:")
-    has_any_change = False
-    for change_key, items in changes.items():
-        if items:
-            has_any_change = True
-            parts = change_key.split("_to_")
-            from_dec, to_dec = parts[0], parts[1]
-            print(f"   • Reclassified {len(items):>3} videos: [{from_dec.upper()}] ➔ [{to_dec.upper()}]")
-            for aid, fname, _ in items[:5]:
-                print(f"       - {fname} ({aid[:8]}...)")
+    if conflicts_resolved:
+        print(f"\n   ⚠️  Resolved {len(conflicts_resolved)} CONFLICTED video(s) ➔ [REVIEW] (enforced single album):")
+        for aid, fn, albs in conflicts_resolved[:10]:
+            print(f"       - {fn} ({aid[:8]}...) was in albums: {', '.join(albs)} ➔ moved to [REVIEW]")
+        if len(conflicts_resolved) > 10:
+            print(f"       ... and {len(conflicts_resolved) - 10} more conflicted video(s)")
+
+    total_reclassified = sum(len(v) for v in changes.values())
+    if total_reclassified > 0:
+        for ch_key, items in changes.items():
+            fr, to = ch_key.split("_to_")
+            print(f"\n   • Reclassified {len(items):3d} videos: [{fr.upper()}] ➔ [{to.upper()}]")
+            for aid, fn, _ in items[:5]:
+                print(f"       - {fn} ({aid[:8]}...)")
             if len(items) > 5:
                 print(f"       ... and {len(items) - 5} more")
 
-    if not has_any_change:
-        print("   ✅ No reclassification changes detected. Local checkpoint matches Immich albums.")
-    else:
-        status_msg = "Would update" if dry_run else "Successfully updated"
-        print(f"\n   🎉 {status_msg} {updated_count} record(s) in SQLite checkpoint.")
+    if album_removals["static"] or album_removals["dynamic"] or album_additions["review"]:
+        print("\n   📁 Reconciled Immich Albums to Match Decisions:")
+        if album_removals["static"]:
+            print(f"       - Removed {len(album_removals['static'])} asset(s) from '{album_name_map['static']}'")
+        if album_removals["dynamic"]:
+            print(f"       - Removed {len(album_removals['dynamic'])} asset(s) from '{album_name_map['dynamic']}'")
+        if album_additions["review"]:
+            print(f"       - Added {len(album_additions['review'])} asset(s) to '{album_name_map['review']}'")
 
-    # Re-sync tags if requested
-    if sync_tags and updated_count > 0 and not dry_run:
-        print("\n🏷  Updating Immich tags to match new album classifications...")
-        existing_tags = client.get_tags()
-        tags_by_name = {t.get("name"): t for t in existing_tags}
-        tag_name_map = {
-            "static": os.environ.get("TAG_STATIC", "video:static"),
-            "review": os.environ.get("TAG_REVIEW", "video:review"),
-            "dynamic": os.environ.get("TAG_DYNAMIC", "video:dynamic"),
-        }
-        for change_key, items in changes.items():
-            if not items:
-                continue
-            parts = change_key.split("_to_")
-            from_dec, to_dec = parts[0], parts[1]
-            old_tag_name = tag_name_map.get(from_dec)
-            new_tag_name = tag_name_map.get(to_dec)
-            old_tag_obj = tags_by_name.get(old_tag_name)
-            new_tag_obj = tags_by_name.get(new_tag_name)
-            aids = [item[0] for item in items]
-            if old_tag_obj:
-                client.untag_assets(old_tag_obj["id"], aids)
-            if not new_tag_obj and new_tag_name:
-                new_tag_obj = client.create_tag(new_tag_name)
-                tags_by_name[new_tag_name] = new_tag_obj
-            if new_tag_obj:
-                client.tag_assets(new_tag_obj["id"], aids)
-        print("   ✅ Immich tags updated.")
+    if protected_unsynced_count > 0:
+        print(f"\n   🛡️  Preserved {protected_unsynced_count} newly detected local video(s) (pending initial `immich-static sync`).")
+
+    if total_reclassified == 0 and not conflicts_resolved:
+        print("\n   ✅ No reclassification changes detected. Local checkpoint matches Immich albums.")
+
+    updated_total = len(db_decision_updates)
+    if updated_total > 0 and not dry_run:
+        print(f"\n   🎉 Successfully updated {updated_total} record(s) in SQLite checkpoint.")
     print()
+
+    return {
+        "status": "ok",
+        "conflicts_resolved": len(conflicts_resolved),
+        "reclassified": total_reclassified,
+        "protected_unsynced": protected_unsynced_count,
+        "updated": updated_total,
+    }
+
+
+# Backwards-compatible alias
+pull_albums_to_checkpoint = pull_immich_to_checkpoint
 
 
 def display_storage_stats(
@@ -742,18 +909,19 @@ def run_sync(args: Any):
     """Executes the `immich-static sync` command."""
     client, ckpt = _get_client_and_ckpt(args, require_ckpt=True, require_client=True)
     dry_run = getattr(args, "dry_run", False)
-    sync_tags = not getattr(args, "no_tags", False)
     sync_albums = not getattr(args, "no_albums", False)
     include_dynamic = getattr(args, "include_dynamic", True)
 
     if dry_run:
         print("🔎 Running in DRY-RUN mode. No write changes will be made.\n")
 
+    if getattr(args, "cleanup_tags", False):
+        cleanup_legacy_tags(client)
+
     sync_immich(
         client=client,
         ckpt=ckpt,
         dry_run=dry_run,
-        sync_tags=sync_tags,
         sync_albums=sync_albums,
         include_dynamic=include_dynamic,
         prune=getattr(args, "prune", False),
@@ -771,7 +939,6 @@ def run_pull(args: Any):
     """Executes the `immich-static pull` command."""
     client, ckpt = _get_client_and_ckpt(args, require_ckpt=True, require_client=True)
     dry_run = getattr(args, "dry_run", False)
-    sync_tags = not getattr(args, "no_tag_sync_on_pull", False)
 
     if dry_run:
         print("🔎 Running in DRY-RUN mode. No write changes will be made.\n")
@@ -780,7 +947,6 @@ def run_pull(args: Any):
         client=client,
         ckpt=ckpt,
         dry_run=dry_run,
-        sync_tags=sync_tags,
     )
     print("✨ Complete!")
 
